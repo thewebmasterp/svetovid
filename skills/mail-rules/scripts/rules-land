@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# rules-land <name> [--uploaded] — publish a committed rules change. The only step
+# that touches the live system, serialized by one lock shared by all agents:
+#
+#   1. rebase rules-<name> onto origin/<branch>  (conflict: abort, exit 2)
+#   2. checks: rules.check_command (if set), sieve-sim --check (every rule
+#      replayable), and the server's own validation (sieve-server check)
+#   3. push HEAD:<branch>, then upload according to rules.upload:
+#        git-push     the repo's own hook uploads and activates on push
+#        managesieve  sieve-server put + activate
+#        browser      prints what to paste where and stops (exit 5); after
+#                     pasting, run: rules-land <name> --uploaded
+#   4. verify that the server runs exactly your script (sieve-server same)
+#   5. sieve-probe, then sieve-probe --clean (inside the lock, so --clean
+#      removes every agent's probes). Without [[rules.probe.case]] in the
+#      config this step is skipped, and says so.
+#   6. fast-forward the main checkout of rules.repo when it is clean
+#
+# rules.verify = "none" skips the ManageSieve steps (2c, 4) for providers
+# without ManageSieve. Waits up to 30 min for the lock.
+set -euo pipefail
+name="${1:?usage: rules-land <name> [--uploaded]}"; uploaded="${2:-}"
+[[ "$name" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || { echo "rules-land: '$name' is not a workspace name (lowercase letters, digits, . _ -)" >&2; exit 1; }
+HERE="$(dirname "$(readlink -f "$0")")"; ROOT="$(cd "$HERE/../../.." && pwd)"; SV=(python3 -I "$ROOT/lib/svetovid.py")
+REPO="$("${SV[@]}" path rules.repo)"; BRANCH="$("${SV[@]}" get rules.branch main)"
+SCRIPT="$("${SV[@]}" get rules.script)"; UPLOAD="$("${SV[@]}" get rules.upload)"
+VERIFY="$("${SV[@]}" get rules.verify managesieve)"; CHECK="$("${SV[@]}" get rules.check_command "")"
+CACHE="$("${SV[@]}" cache)"; WS="$CACHE/rules/$name"; WT="$WS/sieve"; LOCK="$CACHE/rules/land.lock"
+[[ -d "$WT" ]] || { echo "rules-land: no workspace '$name'" >&2; exit 1; }
+cd "$WT"
+[[ -z "$(git status --porcelain)" ]] || { echo "rules-land: commit your changes in $WT first" >&2; git status --short >&2; exit 1; }
+
+exec 9>"$LOCK"
+if ! flock -n 9; then
+    echo "rules-land: another agent is landing; waiting for the lock (max 30 min) ..."
+    flock -w 1800 9 || { echo "rules-land: lock timeout" >&2; exit 1; }
+fi
+echo "rules-land: lock held"
+
+if [[ "$uploaded" != "--uploaded" ]]; then
+    # 1. rebase
+    git fetch -q origin
+    if ! git rebase -q "origin/$BRANCH"; then
+        git rebase --abort || true
+        echo "rules-land: rebase onto origin/$BRANCH conflicts. Lock released. Resolve in $WT:" >&2
+        echo "         git rebase origin/$BRANCH; fix (independent blocks: keep both); git rebase --continue; rules-land $name" >&2
+        exit 2
+    fi
+    # 2. checks
+    [[ -z "$CHECK" ]] || bash -c "$CHECK \"\$1\"" _ "$SCRIPT"
+    SIEVE_MAIN="$WT/$SCRIPT" python3 -I "$HERE/sieve-sim" --check
+    [[ "$VERIFY" == "none" ]] || python3 -I "$HERE/sieve-server" check "$WT/$SCRIPT"
+    # 3. push + upload
+    if ! pushed="$(git push origin "HEAD:$BRANCH" 2>&1)"; then
+        echo "$pushed" >&2; echo "rules-land: the push to origin/$BRANCH failed (above); nothing was uploaded" >&2; exit 1
+    fi
+    grep -E 'uploaded|->|rror|pre-push|deploy' <<<"$pushed" || true
+    git fetch -q origin
+    [[ "$(git rev-parse HEAD)" == "$(git rev-parse "origin/$BRANCH")" ]] || { echo "rules-land: push did not land" >&2; exit 1; }
+    case "$UPLOAD" in
+        git-push) ;;
+        managesieve)
+            python3 -I "$HERE/sieve-server" put "$WT/$SCRIPT"
+            python3 -I "$HERE/sieve-server" activate ;;
+        browser)
+            echo "rules-land: upload by hand now: open your provider's Sieve editor, replace the"
+            echo "         active script with the contents of $WT/$SCRIPT, save, then run:"
+            echo "         rules-land $name --uploaded"
+            exit 5 ;;
+        *) echo "rules-land: unknown rules.upload '$UPLOAD'" >&2; exit 1 ;;
+    esac
+fi
+
+# 4. verify what the server runs
+if [[ "$VERIFY" != "none" ]]; then
+    python3 -I "$HERE/sieve-server" same "$WT/$SCRIPT" || { echo "rules-land: the server runs something else; investigate" >&2; exit 1; }
+fi
+
+# 5. probe (re-check once for mail still in transit), then clean
+rc=0; out="$(timeout 300 python3 -I "$HERE/sieve-probe" 2>&1)" || rc=$?
+if [[ $rc -eq 3 ]]; then    # sieve-probe: no cases configured
+    echo "rules-land: no [[rules.probe.case]] in the config: deployed, but not proven with real mail (config.example.toml, [rules.probe])"
+else
+    echo "$out" | tail -1
+    if ! grep -q "all probes landed as expected" <<<"$out"; then
+        token="$(grep -o -- '--report [0-9a-f]*' <<<"$out" | awk '{print $2}' | tail -1 || true)"
+        if [[ -n "$token" ]]; then
+            sleep 60
+            out="$(timeout 200 python3 -I "$HERE/sieve-probe" --report "$token" 2>&1 || true)"; echo "$out" | tail -14
+        else
+            echo "$out" | tail -5 >&2
+            echo "rules-land: the probe send failed before a token was printed (e.g. a temporary SMTP refusal when several agents probe at once); wait a few minutes and rerun rules-land $name --uploaded" >&2
+        fi
+    fi
+    sleep 15; timeout 200 python3 -I "$HERE/sieve-probe" --clean 2>&1 | tail -1 || true
+    grep -q "all probes landed as expected" <<<"$out" || { echo "rules-land: PROBE FAILED (see above). Deployed anyway; investigate now." >&2; exit 4; }
+fi
+
+# 6. keep the main checkout current (sieve-sim reads it by default)
+if [[ -z "$(git -C "$REPO" status --porcelain)" && "$(git -C "$REPO" branch --show-current)" == "$BRANCH" ]]; then
+    git -C "$REPO" merge -q --ff-only "origin/$BRANCH" && echo "rules-land: main checkout fast-forwarded"
+else
+    echo "rules-land: note: the main checkout has local edits or another branch; left alone" >&2
+fi
+echo "rules-land: done for $name; lock released"

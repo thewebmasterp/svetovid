@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# rules-done <name> — close a workspace: remove the worktree, delete the branch
+# (only if it is merged into origin/<branch>), delete <cache>/rules/<name>.
+# Refuses while there are unlanded commits or uncommitted edits.
+set -euo pipefail
+name="${1:?usage: rules-done <name>}"
+[[ "$name" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || { echo "rules-done: '$name' is not a workspace name (lowercase letters, digits, . _ -)" >&2; exit 1; }
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")/../../.." && pwd)"; SV=(python3 -I "$ROOT/lib/svetovid.py")
+REPO="$("${SV[@]}" path rules.repo)"; BRANCH="$("${SV[@]}" get rules.branch main)"
+WS="$("${SV[@]}" cache)/rules/$name"
+[[ -d "$WS" ]] || { echo "rules-done: nothing open for '$name'"; exit 0; }
+if [[ -d "$WS/sieve" ]]; then
+    git -C "$REPO" fetch -q origin
+    if [[ -n "$(git -C "$WS/sieve" status --porcelain)" ]]; then
+        echo "rules-done: uncommitted edits in $WS/sieve; land or discard them first" >&2; exit 1; fi
+    if ! git -C "$REPO" merge-base --is-ancestor "rules-$name" "origin/$BRANCH"; then
+        echo "rules-done: rules-$name has commits not on origin/$BRANCH (rules-land $name); to abandon: git -C $REPO branch -D rules-$name" >&2; exit 1; fi
+    git -C "$REPO" worktree remove "$WS/sieve"
+    git -C "$REPO" branch -q -d "rules-$name"
+fi
+rm -rf "$WS"
+echo "rules-done: $name closed"

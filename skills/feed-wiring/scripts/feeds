@@ -1,0 +1,864 @@
+#!/usr/bin/env python3
+"""feeds — wire a source to what you read.
+
+    mail folder -> bridge (mailfeed, feeds.toml) -> hub source + tag (RSSBox) -> reader (Miniflux)
+
+Each layer has its own command, so a case that does not fit the usual shape
+can be assembled by hand; `add` and `remove` chain them for the common case.
+
+  Look
+    list                       every mail channel and how far it is wired
+    senders <folder>           who writes into a mail folder
+    tags                       every RSSBox tag, its sources, its Miniflux feed
+
+  One layer at a time
+    skip-subject [--set RE]    the bridge's file-wide rule for subjects that never
+                               reach a feed (login codes, password mails): show / set
+    alias-sync                 hand the bridge what the alias service's module knows
+                               (the real sender's header, the banner to strip)
+    feed-add / feed-remove     publish / stop publishing a folder (mailfeed only)
+    source-add / source-remove any feed URL as an RSSBox source, under a tag or untagged
+    subscribe                  Miniflux follows an RSSBox tag, or a URL directly
+
+  Whole chain
+    add      feed-add + source-add + subscribe   (--tag T), or
+             feed-add + direct Miniflux subscription (--direct)
+    remove   the reverse
+
+Runs where you work. It reaches the host that runs the bridge and the hub
+with feeds.host_command (e.g. "ssh -o BatchMode=yes myserver"; empty = this
+machine) and the reader with the API token from feeds.reader_token_command.
+Every add is idempotent: run it again after a failure and it finishes
+whatever is missing. `<command> --help` lists the options.
+
+With feeds.hub = "none" there is no hub: --tag T means "reader category T"
+and the reader follows each feed directly.
+
+Settings: the [feeds] table of config.toml (see config.example.toml).
+Standard library only. Never prints the token.
+"""
+import argparse
+import json
+import re
+import shlex
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "lib"))
+import svetovid as sv  # noqa: E402
+
+HOST_COMMAND = sv.get("feeds.host_command", "")
+MAILFEED_URL = sv.get("feeds.bridge_url", "")              # as the hub (or reader) sees it
+HUB = sv.get("feeds.hub", "rssbox")
+RSSBOX_TAG_URL = sv.get("feeds.hub_tag_url", "")           # as the reader sees it
+HUB_CONTAINER = sv.get("feeds.hub_container", "rssbox")
+MINIFLUX = sv.get("feeds.reader_url", "")
+SOURCE_PREFIX = sv.get("feeds.source_prefix", "[MAIL] ")
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+CHECKING = False    # set by `check`: doctor reads stdout, so a failure there is a FAIL line
+
+
+def die(message):
+    if CHECKING:
+        print("FAIL " + " ".join(str(message).split())[:300])
+    else:
+        print(f"error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def need_config(*keys):
+    missing = [k for k in keys if not sv.get(k, "")]
+    if missing:
+        die("config.toml lacks " + ", ".join(missing) + " (config.example.toml, [feeds])")
+
+
+# --------------------------------------------------------------------------
+# Runs on the bridge's host (python3 - '<json>'): feeds.toml, the mirror, the container
+# --------------------------------------------------------------------------
+BRIDGE_HOST_SCRIPT = r'''
+import email, email.parser, email.policy, email.utils, collections, glob, json, os
+import re, shutil, subprocess, sys, time, tomllib
+
+args = json.loads(sys.argv[1])
+APP = args["bridge_dir"]
+TOML = APP + "/feeds.toml"
+MIRROR = args["mirror"]
+CONTAINER = args["container"]
+PORT = args["port"]
+ALIAS = args.get("alias") or {}     # the user's alias service, from its module (lib/aliases)
+
+
+def out(**data):
+    print("RESULT " + json.dumps(data, ensure_ascii=False))
+
+
+def entry_count(name):
+    code = ("import urllib.request as u;"
+            "print(u.urlopen('http://127.0.0.1:%d/%s.xml', timeout=10).read().count(b'<entry>'))" % (PORT, name))
+    r = subprocess.run(["docker", "exec", CONTAINER, "python", "-c", code],
+                       capture_output=True, text=True)
+    return int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip().isdigit() else None
+
+
+def restart():
+    subprocess.run(["docker", "restart", CONTAINER], capture_output=True, check=True)
+    for _ in range(30):
+        r = subprocess.run(["docker", "inspect", CONTAINER, "--format", "{{.State.Health.Status}}"],
+                           capture_output=True, text=True)
+        if r.stdout.strip() == "healthy":
+            return True
+        time.sleep(2)
+    return False
+
+
+def feeds():
+    with open(TOML, "rb") as handle:
+        return {k: v for k, v in tomllib.load(handle).items() if isinstance(v, dict)}
+
+
+def settings():
+    """The file-wide settings: every top-level key that is not a feed's table."""
+    with open(TOML, "rb") as handle:
+        return {k: v for k, v in tomllib.load(handle).items() if not isinstance(v, dict)}
+
+
+def default_skip():
+    """The file-wide skip_subject (top level, above the first table), or None."""
+    value = settings().get("skip_subject")
+    return value if isinstance(value, str) else None
+
+
+def toml_value(value):
+    if isinstance(value, list):
+        return "[" + ", ".join(json.dumps(x, ensure_ascii=False) for x in value) + "]"
+    return json.dumps(value, ensure_ascii=False)
+
+
+def write_settings(changes):
+    """Set (or, with None, remove) file-wide keys. They must stand above the
+    first table, one per line; the result is parsed before it replaces the file."""
+    lines = open(TOML, encoding="utf-8").read().split("\n")
+    for key, value in changes.items():
+        first_table = next((i for i, line in enumerate(lines) if line.lstrip().startswith("[")), len(lines))
+        at = next((i for i in range(first_table) if re.match(r"\s*%s\s*=" % re.escape(key), lines[i])), None)
+        if value is None:
+            if at is not None:
+                del lines[at]
+        elif at is None:
+            lines[first_table:first_table] = ["%s = %s" % (key, toml_value(value)), ""]
+        else:
+            lines[at] = "%s = %s" % (key, toml_value(value))
+    text = "\n".join(lines)
+    parsed = tomllib.loads(text)
+    for key, value in changes.items():
+        assert parsed.get(key) == value, "the edit did not produce the setting %r" % key
+    with open(TOML + ".tmp", "w", encoding="utf-8") as handle:
+        handle.write(text)
+    os.replace(TOML + ".tmp", TOML)
+
+
+action = args["action"]
+
+if action == "list":
+    out(default_skip=default_skip(), settings=settings(),
+        feeds={name: {"folder": o.get("folder", name), "title": o.get("title", name),
+                      "from": o.get("from", []), "entries": entry_count(name),
+                      "folder_exists": os.path.isdir(os.path.join(MIRROR, o.get("folder", name)))}
+               for name, o in feeds().items()})
+
+elif action == "senders":
+    folder = args["folder"]
+    base = os.path.join(MIRROR, folder)
+    if "/" in folder or not os.path.isdir(base):
+        out(error="no folder %r in the mirror (a new folder appears at the mirror's next sync)" % folder)
+        sys.exit(0)
+    parser = email.parser.BytesHeaderParser(policy=email.policy.default)
+    rows = collections.defaultdict(lambda: {"n": 0, "bulk": 0, "last": 0, "subject": "", "name": ""})
+    total = 0
+    for path in glob.glob(base + "/cur/*") + glob.glob(base + "/new/*"):
+        try:
+            h = parser.parse(open(path, "rb"))
+        except Exception:
+            continue
+        total += 1
+        raw = next((h.get(n) for n in ALIAS.get("display", []) if h.get(n)), None) or h.get("From") or ""
+        name, address = email.utils.parseaddr(str(raw))
+        unsub = str(h.get("List-Unsubscribe", ""))
+        hosts = re.findall(r"https?://([^/>\s]+)|mailto:[^@>]+@([^>?\s,]+)", unsub)
+        # the alias service's own unsubscribe link is on every forward: it says nothing
+        own = [a or b for a, b in hosts if not any(d in (a or b) for d in ALIAS.get("domains", []))]
+        bulk = bool(own) or h.get("List-Id") is not None or str(h.get("Precedence", "")).lower() in ("bulk", "list")
+        try:
+            ts = email.utils.parsedate_to_datetime(str(h.get("Date"))).timestamp()
+        except Exception:
+            ts = 0
+        row = rows[address.lower()]
+        row["n"] += 1
+        row["bulk"] += bulk
+        row["name"] = name or row["name"]
+        if ts >= row["last"]:
+            row["last"] = ts
+            # digits masked: a subject can carry a login code
+            row["subject"] = re.sub(r"\d{4,}", "####", str(h.get("Subject", "")).replace("\n", " "))[:70]
+    out(folder=folder, total=total,
+        senders=[{"address": a, "name": r["name"], "count": r["n"], "bulk": r["bulk"],
+                  "last": time.strftime("%Y-%m-%d", time.gmtime(r["last"])) if r["last"] else "?",
+                  "latest_subject": r["subject"]}
+                 for a, r in sorted(rows.items(), key=lambda kv: -kv[1]["n"])])
+
+elif action == "default":
+    current = default_skip()
+    if "set" not in args:
+        out(skip_subject=current)
+        sys.exit(0)
+    write_settings({"skip_subject": args["set"]})
+    out(skip_subject=args["set"], was=current)      # read again on the bridge's next pass: no restart
+
+elif action == "settings":
+    before = settings()
+    if args.get("set"):
+        write_settings(args["set"])
+    out(settings=settings(), before=before)
+
+elif action == "add":
+    name = args["name"]
+    existing = feeds()
+    if name in existing:
+        out(status="exists", entries=entry_count(name),
+            folder_exists=os.path.isdir(os.path.join(MIRROR, existing[name].get("folder", name))))
+        sys.exit(0)
+    text = open(TOML, encoding="utf-8").read().rstrip("\n") + "\n\n" + args["block"].rstrip("\n") + "\n"
+    parsed = tomllib.loads(text)                      # refuse to write a broken file
+    assert name in parsed and isinstance(parsed[name], dict), "block did not add the feed"
+    if args.get("dry_run"):
+        out(status="dry-run", folder_exists=os.path.isdir(os.path.join(MIRROR, args["folder"])))
+        sys.exit(0)
+    with open(TOML + ".tmp", "w", encoding="utf-8") as handle:
+        handle.write(text)
+    os.replace(TOML + ".tmp", TOML)
+    healthy = restart()
+    out(status="added", healthy=healthy, entries=entry_count(name),
+        folder_exists=os.path.isdir(os.path.join(MIRROR, args["folder"])))
+
+elif action == "remove":
+    name = args["name"]
+    lines = open(TOML, encoding="utf-8").read().split("\n")
+    head = re.compile(r"^\s*\[\s*(?:%s|\"%s\"|'%s')\s*\]\s*(#.*)?$" % ((re.escape(name),) * 3))
+    start = next((i for i, line in enumerate(lines) if head.match(line)), None)
+    if start is None:
+        # still listed but not found: a header form this cannot edit. Say so
+        # instead of reporting it gone while the bridge keeps publishing it.
+        out(status="unreadable" if name in feeds() else "absent")
+        sys.exit(0)
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("[")), len(lines))
+    kept = lines[:start] + lines[end:]
+    text = re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).rstrip("\n") + "\n"
+    assert name not in tomllib.loads(text)
+    with open(TOML + ".tmp", "w", encoding="utf-8") as handle:
+        handle.write(text)
+    os.replace(TOML + ".tmp", TOML)
+    out(status="removed", healthy=restart())
+'''
+
+# --------------------------------------------------------------------------
+# Runs inside the rssbox container (manage.py shell); arguments in $MF_ARGS
+# --------------------------------------------------------------------------
+RSSBOX_SCRIPT = r'''
+import json, os
+from core.models import Feed, Tag
+from core.models.filter import bump_cache_version
+from core.management.commands.feed_updater import update_single_feed
+
+args = json.loads(os.environ["MF_ARGS"])
+
+
+def out(**data):
+    print("RESULT " + json.dumps(data, ensure_ascii=False, default=str))
+
+
+action = args["action"]
+if action == "tags":
+    out(tags=[{"slug": t.slug, "name": t.name,
+               "sources": [{"name": f.name, "url": f.feed_url, "entries": f.entries.count(),
+                            "fetch_ok": f.fetch_status} for f in t.feeds.order_by("name")]}
+              for t in Tag.objects.order_by("name")],
+        untagged=[{"name": f.name, "url": f.feed_url} for f in Feed.objects.filter(tags=None).order_by("name")])
+elif action == "list":
+    out(feeds=[{"url": f.feed_url, "name": f.name, "entries": f.entries.count(),
+                "fetch_ok": f.fetch_status, "tags": [t.slug for t in f.tags.all()]}
+               for f in Feed.objects.filter(feed_url__startswith=args["prefix"])])
+elif action == "health":
+    import statistics
+    from django.utils import timezone
+    now = timezone.now()
+    rows = []
+    for f in Feed.objects.order_by("name"):
+        dates = sorted((e.pubdate for e in f.entries.exclude(pubdate=None).order_by("-pubdate")[:11]), reverse=True)
+        gaps = [(a - b).total_seconds() / 3600 for a, b in zip(dates, dates[1:])]
+        rows.append({"name": f.name, "url": f.feed_url, "fetch_ok": f.fetch_status,
+                     "entries": f.entries.count(), "every_min": f.update_frequency,
+                     "last_fetch": f.last_fetch, "newest": dates[0] if dates else None,
+                     "silent_h": round((now - dates[0]).total_seconds() / 3600, 1) if dates else None,
+                     "median_gap_h": round(statistics.median(gaps), 1) if gaps else None,
+                     "tags": [t.slug for t in f.tags.all()]})
+    out(feeds=rows)
+elif action == "add":
+    # The shell skips Django validation; the admin form does not. Check the URL
+    # here so a source never exists that the admin refuses to save (bare host
+    # names like "mailfeed" fail URLValidator: use "<name>.internal").
+    from django.core.validators import URLValidator
+    URLValidator()(args["url"])
+    feed, created = Feed.objects.get_or_create(
+        feed_url=args["url"],
+        defaults={"name": args["feed_name"], "update_frequency": args.get("every", 60),
+                  "max_posts": args["max_posts"]},
+    )
+    tag, tag_created = None, False
+    if args.get("tag"):   # no tag: the source lives in RSSBox only
+        tag, tag_created = Tag.objects.get_or_create(name=args["tag"])
+        feed.tags.add(tag)
+    Feed.objects.filter(pk=feed.pk).update(etag="")   # fetch for real, not a 304
+    feed.refresh_from_db()
+    update_single_feed(feed)
+    feed.refresh_from_db()
+    out(created=created, name=feed.name, fetch_ok=feed.fetch_status, entries=feed.entries.count(),
+        tag=tag and tag.name, tag_slug=tag and tag.slug, tag_created=tag_created,
+        tag_feeds=sorted(f.name for f in tag.feeds.all()) if tag else [])
+elif action == "remove":
+    feed = Feed.objects.filter(feed_url=args["url"]).first()
+    if feed is None:
+        out(status="absent")
+    else:
+        tags = list(feed.tags.all())
+        name = feed.name
+        feed.delete()
+        report = []
+        for tag in tags:
+            left = tag.feeds.count()
+            dropped = False
+            if left == 0 and args.get("drop_empty_tag"):
+                slug = tag.slug
+                tag.delete()
+                dropped = True
+                report.append({"slug": slug, "feeds_left": 0, "dropped": True})
+                continue
+            bump_cache_version("tag", tag.pk)
+            report.append({"slug": tag.slug, "feeds_left": left, "dropped": dropped})
+        out(status="removed", name=name, tags=report)
+'''
+
+
+def run_remote(command, script):
+    """Run a script on the bridge's host, return the parsed RESULT line."""
+    argv = shlex.split(HOST_COMMAND) + [command] if HOST_COMMAND else ["sh", "-c", command]
+    try:
+        proc = subprocess.run(argv, input=script, capture_output=True, text=True, timeout=330)
+    except subprocess.TimeoutExpired:
+        die("the bridge's host did not answer within 330 s (feeds.host_command)")
+    for line in proc.stdout.splitlines():
+        if line.startswith("RESULT "):
+            return json.loads(line[7:])
+    tail = (proc.stderr or proc.stdout).strip().splitlines()[-6:]
+    hint = ""
+    if "Permission denied" in proc.stderr:
+        hint = " (is the key agent / keyring unlocked?)"
+    die(f"remote step failed{hint}:\n  " + "\n  ".join(tail))
+
+
+# feeds.toml is read-modify-written on the bridge's host. Several agents may
+# run this at once (the route skill), so every bridge step holds one lock there.
+BRIDGE_DIR = sv.get("feeds.bridge_dir", "")
+# default: beside the bridge's folder (in it, when that folder sits at the root)
+BRIDGE_LOCK = sv.get("feeds.bridge_lock",
+                     (BRIDGE_DIR.rstrip("/").rsplit("/", 1)[0] or BRIDGE_DIR.rstrip("/")) + "/.feeds.lock")
+
+
+def bridge(**args):
+    need_config("feeds.bridge_dir", "feeds.bridge_url", "feeds.mirror")
+    args.update(bridge_dir=BRIDGE_DIR, mirror=sv.get("feeds.mirror"),
+                container=sv.get("feeds.bridge_container", "mailfeed"),
+                port=urllib.parse.urlsplit(MAILFEED_URL).port or 80,
+                alias={"display": list(sv.alias().DISPLAY_HEADERS), "domains": list(sv.alias().OWN_DOMAINS)})
+    return run_remote(f"flock -w 300 {shlex.quote(BRIDGE_LOCK)} python3 - " + shlex.quote(json.dumps(args)),
+                      BRIDGE_HOST_SCRIPT)
+
+
+def rssbox(**args):
+    if HUB == "none":
+        die("feeds.hub is \"none\": there is no hub; use the reader's categories (add --tag T)")
+    command = ("docker exec -i -e MF_ARGS=" + shlex.quote(json.dumps(args))
+               + f" {HUB_CONTAINER} python manage.py shell")
+    return run_remote(command, RSSBOX_SCRIPT)
+
+
+# --------------------------------------------------------------------------
+# Miniflux
+# --------------------------------------------------------------------------
+_token = None
+
+
+def miniflux(method, path, data=None, timeout=60):
+    global _token
+    need_config("feeds.reader_url", "feeds.reader_token_command")
+    if _token is None:
+        proc = sv.run(sv.get("feeds.reader_token_command"), capture_output=True, timeout=30)
+        _token = proc.stdout.strip()
+        if not _token:
+            die("no reader token from feeds.reader_token_command (keyring locked?)")
+    request = urllib.request.Request(
+        MINIFLUX + path, method=method,
+        data=json.dumps(data).encode() if data is not None else None,
+        headers={"X-Auth-Token": _token, "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read()
+            return response.status, (json.loads(body) if body else None)
+    except urllib.error.HTTPError as error:
+        return error.code, error.read().decode(errors="replace")[:300]
+    except (TimeoutError, urllib.error.URLError) as error:
+        return 0, str(error)
+
+
+def miniflux_feed(url):
+    status, feeds = miniflux("GET", "/feeds")
+    if status != 200:
+        die(f"Miniflux /feeds answered {status}: {feeds}")
+    return next((f for f in feeds if f["feed_url"] == url), None)
+
+
+def miniflux_subscribe(url, title, category):
+    """Make sure Miniflux follows `url`. Returns a one-line report."""
+    feed = miniflux_feed(url)
+    if feed:
+        return f"already subscribed: {feed['category']['title']} / {feed['title']}"
+    if not category:
+        return ("NOT subscribed: Miniflux does not follow this yet and no --category was given. "
+                f"Re-run with --category (feed address {url}).")
+    status, categories = miniflux("GET", "/categories")
+    cat = next((c for c in categories if c["title"].lower() == category.lower()), None)
+    created_category = False
+    if cat is None:
+        status, cat = miniflux("POST", "/categories", {"title": category})
+        if status != 201:
+            die(f"could not create Miniflux category {category!r}: {status} {cat}")
+        created_category = True
+    status, result = miniflux("POST", "/feeds", {"feed_url": url, "category_id": cat["id"]}, timeout=180)
+    if status != 201:
+        # A slow first fetch makes the proxy answer 504 while Miniflux still
+        # creates the feed, so look for it before giving up.
+        for _ in range(12):
+            time.sleep(10)
+            feed = miniflux_feed(url)
+            if feed:
+                break
+        else:
+            die(f"Miniflux did not create the feed: {status} {result}")
+        feed_id = feed["id"]
+    else:
+        feed_id = result["feed_id"]
+    if title:
+        miniflux("PUT", f"/feeds/{feed_id}", {"title": title})
+    note = " (category created)" if created_category else ""
+    return f"subscribed: {cat['title']} / {title or url}{note}"
+
+
+def miniflux_unsubscribe(url):
+    feed = miniflux_feed(url)
+    if not feed:
+        return None
+    status, _ = miniflux("DELETE", f"/feeds/{feed['id']}")
+    return f"{feed['category']['title']} / {feed['title']} (HTTP {status})"
+
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+def toml_string(value):
+    return json.dumps(value, ensure_ascii=False)
+
+
+def build_block(a):
+    lines = [f"[{a.name}]"]
+    if a.folder != a.name:
+        lines.append(f"folder = {toml_string(a.folder)}")
+    lines.append(f"title = {toml_string(a.title)}")
+    if a.sender:
+        lines.append("from = [" + ", ".join(toml_string(s) for s in a.sender) + "]")
+    if a.keep_codes:
+        lines.append('skip_subject = ""')
+    if a.max_entries != 50:
+        lines.append(f"max_entries = {a.max_entries}")
+    if a.title_regex:
+        re.compile(a.title_regex)       # refuse a broken pattern before it reaches the bridge
+        lines.append(f"title_regex = {toml_string(a.title_regex)}")
+        lines.append(f"title_item = {toml_string(a.title_item or '{0}')}")
+        lines.append(f"title_format = {toml_string(a.title_format or '{items}')}")
+    if a.title_prefix:
+        lines.append(f"title_prefix = {toml_string(a.title_prefix)}")
+    return "\n".join(lines)
+
+
+TAG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+
+def check_tag(tag):
+    if not TAG_RE.match(tag):
+        die("--tag: use a-z, 0-9, dash. The tag name is its address; renaming it later "
+            "breaks the Miniflux subscription")
+
+
+def feed_url(name):
+    return f"{MAILFEED_URL}/{name}.xml"
+
+
+def do_feed_add(a, step=""):
+    if not NAME_RE.match(a.name):
+        die("--name: use a-z, 0-9, dash, underscore (it becomes the feed address)")
+    a.folder = a.folder or a.name
+    a.title = a.title or a.name
+    block = build_block(a)
+    print("feeds.toml entry:\n" + "\n".join("    " + line for line in block.splitlines()))
+    result = bridge(action="add", name=a.name, folder=a.folder, block=block, dry_run=a.dry_run)
+    if a.dry_run:      # stop here whatever the bridge answered: the later steps change the hub and the reader
+        if result["status"] == "exists":
+            print(f"dry run: {a.name} is already published. Nothing changed.")
+        else:
+            exists = "exists" if result["folder_exists"] else "does NOT exist yet"
+            print(f"dry run: entry is valid; mail folder {a.folder!r} {exists} in the mirror. Nothing changed.")
+        return False
+    state = {"added": "added, mailfeed restarted", "exists": "already there, left as it is"}[result["status"]]
+    print(f"{step}mailfeed: {state}; {feed_url(a.name)} has {result['entries']} entries")
+    if not result["folder_exists"]:
+        print(f"   note: no mail folder {a.folder!r} in the mirror yet. The feed stays empty until the "
+              "first mail arrives (and the mirror has synced).")
+    if result.get("healthy") is False:
+        die("the bridge did not become healthy after the restart: check its container logs")
+    return True
+
+
+def do_source_add(url, name, tag, max_posts=50, every=60, step=""):
+    if tag:
+        check_tag(tag)
+    box = rssbox(action="add", url=url, feed_name=name, tag=tag, max_posts=max_posts, every=every)
+    print(f"{step}RSSBox: source {box['name']!r} {'created' if box['created'] else 'already existed'}, "
+          f"{box['entries']} entries, fetch ok: {box['fetch_ok']}")
+    if box["tag_slug"]:
+        print(f"   tag {box['tag_slug']!r} {'created' if box['tag_created'] else 'already existed'}; "
+              f"it now bundles: {', '.join(box['tag_feeds'])}")
+    else:
+        print("   untagged: lives in RSSBox only (its own feed, no bundle, no Miniflux)")
+    return box
+
+
+def do_source_remove(url, purge, step=""):
+    box = rssbox(action="remove", url=url, drop_empty_tag=purge)
+    print(f"{step}RSSBox: source {box['status']}" + (f" ({box['name']})" if box.get("name") else ""))
+    for tag in box.get("tags", []):
+        if tag["dropped"]:
+            gone = miniflux_unsubscribe(f"{RSSBOX_TAG_URL}/{tag['slug']}")
+            print(f"   tag {tag['slug']!r} was empty: deleted it"
+                  + (f", and its Miniflux feed with stored entries: {gone}" if gone else " (Miniflux had no subscription)"))
+        elif tag["feeds_left"] == 0:
+            print(f"   tag {tag['slug']!r} is now empty but kept, and so is its Miniflux feed. "
+                  "Pass --purge to delete both.")
+        else:
+            print(f"   tag {tag['slug']!r} keeps {tag['feeds_left']} other source(s); Miniflux untouched")
+
+
+def cmd_skip_subject(a):
+    if a.set is None:
+        current = bridge(action="default")["skip_subject"]
+        print("bridge: no file-wide skip_subject: feeds publish every subject, login codes included"
+              if not current else f"bridge: skip_subject = {current}")
+        return
+    try:
+        re.compile(a.set)
+    except re.error as error:
+        die(f"--set is not a regular expression: {error}")
+    result = bridge(action="default", set=a.set)
+    print(f"bridge: skip_subject set (was: {result['was'] or 'not set'}); it applies from the bridge's next pass")
+
+
+def alias_settings():
+    """What the bridge must know about the user's alias service, as its
+    file-wide settings (None = the key should not be there)."""
+    module = sv.alias()
+    return {"sender_headers": list(module.DISPLAY_HEADERS) or None,
+            "strip_html": list(module.BANNER_HTML) or None,
+            "strip_text_lines": list(module.BANNER_LINES) or None}
+
+
+def cmd_alias_sync(a):
+    want = alias_settings()
+    result = bridge(action="settings", set=want)
+    changed = [k for k, v in want.items() if result["before"].get(k) != v]
+    name = sv.alias().NAME or "no alias service"
+    print(f"bridge: alias settings for {name}: " + (f"updated {', '.join(changed)}" if changed else "already in place")
+          + "; they apply from the bridge's next pass")
+
+
+def cmd_feed_add(a):
+    do_feed_add(a)
+
+
+def bridge_remove(name):
+    status = bridge(action="remove", name=name)["status"]
+    if status == "unreadable":
+        die(f"{name} is in feeds.toml but its [table] line is written in a way this cannot edit; "
+            "remove that table by hand, then run this again")
+    return status
+
+
+def cmd_feed_remove(a):
+    print(f"mailfeed: {bridge_remove(a.name)}")
+
+
+def cmd_source_add(a):
+    do_source_add(a.url, a.name, a.tag, a.max_posts, a.every)
+
+
+def cmd_source_remove(a):
+    do_source_remove(a.url, a.purge)
+
+
+def cmd_subscribe(a):
+    if bool(a.tag) == bool(a.url):
+        die("give exactly one of --tag or --url")
+    if a.tag:
+        check_tag(a.tag)
+        if HUB == "none":
+            die('feeds.hub is "none": there are no hub tags to follow; give the feed itself with --url')
+    url = f"{RSSBOX_TAG_URL}/{a.tag}" if a.tag else a.url
+    print("Miniflux: " + miniflux_subscribe(url, a.title, a.category))
+
+
+def cmd_add(a):
+    if bool(a.tag) == a.direct and HUB != "none":
+        die("give exactly one of --tag T (bundle in RSSBox) or --direct (straight into Miniflux)")
+    if a.tag:
+        check_tag(a.tag)
+    if not do_feed_add(a, "1. "):
+        return
+    if HUB == "none":
+        # No hub: the tag is the reader category, and the reader follows the feed itself.
+        print("2. reader: " + miniflux_subscribe(feed_url(a.name), a.miniflux_title or f"{SOURCE_PREFIX}{a.title}",
+                                                 a.category or a.tag))
+        return
+    if a.direct:
+        print("2. Miniflux: " + miniflux_subscribe(feed_url(a.name), a.miniflux_title or f"{SOURCE_PREFIX}{a.title}", a.category))
+        return
+    box = do_source_add(feed_url(a.name), f"{SOURCE_PREFIX}{a.title}", a.tag, a.max_entries, step="2. ")
+    print("3. Miniflux: " + miniflux_subscribe(f"{RSSBOX_TAG_URL}/{box['tag_slug']}", a.miniflux_title, a.category))
+
+
+def cmd_remove(a):
+    print(f"1. mailfeed: {bridge_remove(a.name)}")
+    if HUB != "none":
+        do_source_remove(feed_url(a.name), a.purge, "2. ")
+    step = "2." if HUB == "none" else "3."
+    direct = miniflux_feed(feed_url(a.name))
+    if direct and a.purge:
+        print(f"{step} Miniflux: deleted the direct subscription with its stored entries: "
+              + miniflux_unsubscribe(feed_url(a.name)))
+    elif direct:
+        print(f"{step} Miniflux: direct subscription {direct['title']!r} kept (it will show a fetch error). "
+              "Pass --purge to delete it.")
+
+
+def cmd_tags(a):
+    result = rssbox(action="tags")
+    status, subscribed = miniflux("GET", "/feeds")
+    by_url = {f["feed_url"]: f for f in subscribed} if status == 200 else {}
+    for tag in result["tags"]:
+        sub = by_url.get(f"{RSSBOX_TAG_URL}/{tag['slug']}")
+        where = f"{sub['category']['title']} / {sub['title']}" if sub else "not subscribed"
+        print(f"{tag['slug']}  ->  Miniflux: {where}")
+        for source in tag["sources"]:
+            print(f"    {source['name']}  ({source['entries']} entries, fetch ok: {source['fetch_ok']})")
+    for source in result["untagged"]:
+        print(f"untagged source: {source['name']}  {source['url']}")
+
+
+def cmd_list(a):
+    feeds = bridge(action="list")["feeds"]
+    box = {f["url"]: f for f in rssbox(action="list", prefix=MAILFEED_URL + "/")["feeds"]} if HUB != "none" else {}
+    status, subscribed = miniflux("GET", "/feeds")
+    by_url = {f["feed_url"]: f for f in subscribed} if status == 200 else {}
+    if not feeds:
+        print("no channels in feeds.toml")
+    for name, feed in feeds.items():
+        source = box.pop(f"{MAILFEED_URL}/{name}.xml", None)
+        sender = f", from {feed['from']}" if feed["from"] else ""
+        missing = "" if feed["folder_exists"] else "  [mail folder not in the mirror yet]"
+        print(f"{name}: folder {feed['folder']}{sender}, {feed['entries']} entries{missing}")
+        direct = by_url.get(f"{MAILFEED_URL}/{name}.xml")
+        if direct:
+            print(f"    Miniflux reads it directly: {direct['category']['title']} / {direct['title']}")
+        if not source:
+            if not direct:
+                print("    reader: not subscribed" if HUB == "none" else "    RSSBox: not added; Miniflux: not subscribed")
+            continue
+        print(f"    RSSBox: {source['name']} ({source['entries']} entries, fetch ok: {source['fetch_ok']})")
+        if not source["tags"]:
+            print("    untagged: RSSBox only, no Miniflux")
+        for slug in source["tags"]:
+            sub = by_url.get(f"{RSSBOX_TAG_URL}/{slug}")
+            where = f"{sub['category']['title']} / {sub['title']}" if sub else "not subscribed"
+            print(f"    tag {slug} -> Miniflux: {where}")
+    for url, source in box.items():
+        print(f"orphan in RSSBox (not in feeds.toml): {source['name']} {url}")
+
+
+def cmd_check(a):
+    """Health for doctor: one line per finding, exit 1 when anything FAILs."""
+    global CHECKING
+    CHECKING = True
+    if not sv.get("feeds", {}):
+        print("OK   no [feeds] in the config (mail only): no feed pipeline to check")
+        return 0
+    findings = []
+    listing = bridge(action="list")
+    feeds = listing["feeds"]
+    if feeds and not listing.get("default_skip"):
+        findings.append(("WARN", "the bridge's feeds.toml has no file-wide skip_subject: mail whose subject "
+                                 "carries a login code can be published (feeds skip-subject --set)"))
+    drift = [k for k, v in alias_settings().items() if listing.get("settings", {}).get(k) != v]
+    if feeds and drift:
+        findings.append(("WARN", f"the bridge does not have the alias service's settings ({', '.join(drift)}): "
+                                 "senders and the service's banner may be wrong in feeds (feeds alias-sync)"))
+    box = {f["url"]: f for f in rssbox(action="list", prefix=MAILFEED_URL + "/")["feeds"]} if HUB != "none" else {}
+    status, subscribed = miniflux("GET", "/feeds")
+    if status != 200:
+        findings.append(("FAIL", f"reader API answered {status}"))
+        subscribed = []
+    by_url = {f["feed_url"]: f for f in subscribed}
+    for name, feed in feeds.items():
+        if feed["entries"] is None:
+            findings.append(("FAIL", f"{name}: the bridge does not serve /{name}.xml"))
+        url = f"{MAILFEED_URL}/{name}.xml"
+        source = box.get(url)
+        if source is None and url not in by_url:
+            where = "not followed by the reader" if HUB == "none" else "in neither the hub nor the reader"
+            findings.append(("WARN", f"{name}: published but {where}"))
+        if source and source["fetch_ok"] is False:
+            findings.append(("FAIL", f"{name}: the hub cannot fetch it"))
+        for slug in (source or {}).get("tags", []):
+            if f"{RSSBOX_TAG_URL}/{slug}" not in by_url:
+                findings.append(("WARN", f"{name}: tag {slug} is not followed by the reader"))
+    for f in subscribed:
+        if f.get("parsing_error_count"):
+            findings.append(("FAIL", f"reader: {f['category']['title']} / {f['title']}: "
+                             f"{f['parsing_error_count']} fetch errors ({(f.get('parsing_error_message') or '')[:80]})"))
+    if not any(level == "FAIL" for level, _ in findings):
+        findings.append(("OK", f"{len(feeds)} mail channels published; reader has {len(subscribed)} feeds, none failing"))
+    for level, text in findings:
+        print(f"{level:<4} {text}")
+    return 1 if any(level == "FAIL" for level, _ in findings) else 0
+
+
+def cmd_web_health(a):
+    """Every hub source that is not a mail channel: fetch status and how long it
+    has been silent against its usual gap. --json for scripts (web-feed need)."""
+    rows = [r for r in rssbox(action="health")["feeds"] if not r["url"].startswith(MAILFEED_URL + "/")]
+    if a.json:
+        print(json.dumps(rows, ensure_ascii=False, default=str))
+        return 0
+    for r in rows:
+        gap = f"usual gap {r['median_gap_h']} h" if r["median_gap_h"] is not None else "no history"
+        silent = f"silent {r['silent_h']} h" if r["silent_h"] is not None else "never had entries"
+        print(f"{'ok ' if r['fetch_ok'] is not False else 'ERR'} {r['name'][:44]:<44} {silent}, {gap}, "
+              f"{r['entries']} entries" + (f"  tags {','.join(r['tags'])}" if r["tags"] else ""))
+    return 0
+
+
+def cmd_senders(a):
+    result = bridge(action="senders", folder=a.folder)
+    if "error" in result:
+        die(result["error"])
+    print(f"folder {result['folder']}: {result['total']} messages")
+    print(f"{'count':>5} {'bulk':>5}  {'last':10}  sender")
+    for s in result["senders"]:
+        print(f"{s['count']:5d} {s['bulk']:5d}  {s['last']:10}  {s['address']}  ({s['name']})")
+        print(f"{'':24}latest: {s['latest_subject']}")
+    print("\n'bulk' = messages carrying mailing-list headers. A sender that is all bulk is "
+          "usually the newsletter; pass it to `add --from`.")
+
+
+def feed_options(p):
+    p.add_argument("--name", required=True, help="feed name; address becomes /<name>.xml")
+    p.add_argument("--folder", help="mail folder (default: the name)")
+    p.add_argument("--title", help="human title of the feed")
+    p.add_argument("--from", dest="sender", action="append", default=[], metavar="ADDR",
+                   help="only mail from this sender (repeatable, * allowed)")
+    p.add_argument("--keep-codes", action="store_true",
+                   help="publish every subject in this feed (ignore the bridge's skip_subject)")
+    p.add_argument("--max-entries", type=int, default=50)
+    p.add_argument("--title-regex", help="entry titles from the body: Python regex, named groups")
+    p.add_argument("--title-item", help='per match, e.g. "{company} {amount} {currency}"')
+    p.add_argument("--title-format", help='whole title from {items} {subject} {date}, e.g. "{items} · {date}"')
+    p.add_argument("--title-prefix", help='"<prefix> · " before every entry title (e.g. the shop on a deliveries feed)')
+    p.add_argument("--dry-run", action="store_true", help="validate only, change nothing")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("list", help="every mail channel and how far down the chain it is wired")
+    sub.add_parser("tags", help="every RSSBox tag, its sources and its Miniflux feed")
+    sub.add_parser("check", help="health for doctor: bridge, hub and reader, one line per finding")
+    p = sub.add_parser("web-health", help="hub sources that are not mail: fetch status, silence vs usual gap")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("senders", help="who writes into a mail folder (to pick a --from filter)")
+    p.add_argument("folder")
+
+    p = sub.add_parser("skip-subject", help="bridge only: subjects that never reach any feed (show, or --set)")
+    p.add_argument("--set", metavar="REGEX", help="the new file-wide pattern, in the user's own wording")
+    sub.add_parser("alias-sync", help="bridge only: write the alias service's sender header and banner patterns")
+    p = sub.add_parser("feed-add", help="mailfeed only: publish a folder as /<name>.xml")
+    feed_options(p)
+    p = sub.add_parser("feed-remove", help="mailfeed only: stop publishing")
+    p.add_argument("--name", required=True)
+
+    p = sub.add_parser("source-add", help="RSSBox only: any feed URL as a source under a tag")
+    p.add_argument("--url", required=True)
+    p.add_argument("--name", required=True, help='source name with its type prefix, e.g. "[FB/IG] Page"')
+    p.add_argument("--tag", help="RSSBox tag to bundle it under; omit to keep the source in RSSBox only")
+    p.add_argument("--max-posts", type=int, default=50)
+    p.add_argument("--every", type=int, default=60, help="fetch interval in minutes")
+    p = sub.add_parser("source-remove", help="RSSBox only: delete a source")
+    p.add_argument("--url", required=True)
+    p.add_argument("--purge", action="store_true", help="also delete a tag left empty and its Miniflux feed")
+
+    p = sub.add_parser("subscribe", help="Miniflux only: follow an RSSBox tag or a URL")
+    p.add_argument("--tag")
+    p.add_argument("--url")
+    p.add_argument("--category", help="Miniflux category (needed for a new subscription)")
+    p.add_argument("--title")
+
+    p = sub.add_parser("add", help="whole chain: create a mail channel, or finish a half-created one")
+    feed_options(p)
+    p.add_argument("--tag", help="RSSBox tag to bundle it under (existing or new)")
+    p.add_argument("--direct", action="store_true", help="skip RSSBox: Miniflux reads the mail feed itself")
+    p.add_argument("--category", help="Miniflux category, needed when Miniflux does not follow it yet")
+    p.add_argument("--miniflux-title", help="title of the feed in Miniflux (new subscriptions only)")
+    p = sub.add_parser("remove", help="whole chain: stop publishing a mail channel")
+    p.add_argument("--name", required=True)
+    p.add_argument("--purge", action="store_true",
+                   help="also delete a tag left empty, its Miniflux feed, and a direct subscription")
+    a = parser.parse_args()
+    sys.exit({"check": cmd_check, "web-health": cmd_web_health, "list": cmd_list, "tags": cmd_tags, "senders": cmd_senders, "add": cmd_add, "remove": cmd_remove,
+     "feed-add": cmd_feed_add, "feed-remove": cmd_feed_remove, "source-add": cmd_source_add,
+     "source-remove": cmd_source_remove, "subscribe": cmd_subscribe,
+     "skip-subject": cmd_skip_subject, "alias-sync": cmd_alias_sync}[a.command](a) or 0)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,1127 @@
+#!/usr/bin/env python3
+"""sieve-sim — run your Sieve script over the local copy of your mail.
+
+READ-ONLY on mail: never writes, tags or moves it. (--live fetches the rules
+repo and keeps a copy of the deployed script in the cache.)
+
+Delivery-time Sieve only ever sees new mail, so a rule change is a guess until
+it has been tried on everything you have received. This tool executes the
+script, as written, against every message in the local maildir and reports
+where each one would be filed. Nothing is ported or hand-copied: change the
+script, rerun, and the numbers describe the new rules.
+
+It understands the part of Sieve that filing scripts use (RFC 5228 base,
+variables, fileinto, mailbox, regex):
+
+    require  if / elsif / else  stop  keep  discard  fileinto [:create] [:copy]
+    set [:lower :upper :lowerfirst :upperfirst :quotewildcard :length]
+    tests:   header  address [:all :localpart :domain]  string  exists  size
+             allof  anyof  not  true  false
+    match:   :is  :contains  :matches (sets ${0}..${9})  :regex
+    compare: i;ascii-casemap (default)  i;octet  i;unicode-casemap
+    flags, redirect and vacation are accepted and ignored for filing.
+
+Anything else stops it with the line number, when the script is read and
+wherever the rule stands. That is on purpose: a rule nobody can replay is a
+rule nobody can test. Rewrite the rule.
+
+A message the script would deliver to two folders (a block that forgot its
+"stop") is counted under the first and listed under "delivered to more than
+one folder" in the summary and in --diff.
+
+The script layout svetovid relies on (see STACK.md, "The Sieve script"):
+the variable named by rules.service_var (default "svc") holds the service a
+mail belongs to, the variable rules.class_var (default "why") holds the
+Urgent class, and Urgent mail is filed into rules.urgent_folder (default
+"Urgent"). Sections start with a comment line "# ---- NAME".
+
+Usage:
+  sieve-sim                       per-source summary + destination counts
+  sieve-sim --show FOLDER         sample messages predicted into a folder
+  sieve-sim --moved               only messages whose folder would change
+  sieve-sim --urgent              what would be filed into Urgent, grouped
+  sieve-sim --audit --since D     Urgent maintenance report since D (YYYY-MM-DD)
+  sieve-sim --diff OLD.sieve      every message OLD.sieve and the script file
+                                  differently (run before deploying a change)
+  sieve-sim --explain FILE        trace one message file through the script
+  sieve-sim --live ...            use the script as deployed (origin/<branch>
+                                  of rules.repo) instead of the checkout
+
+  --since D limits --urgent / --audit / --diff to mail dated D or later.
+  SIEVE_MAIN=/path/other.sieve replays a different script;
+  SIEVE_MAILDIR=/path overrides mail.maildir.
+"""
+import argparse
+import email
+import email.parser
+import email.policy
+import email.utils
+import html
+import os
+import re
+import subprocess
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "lib"))
+import svetovid as sv  # noqa: E402
+
+HDR = email.parser.BytesHeaderParser(policy=email.policy.default)
+
+
+def cfg(key, default):
+    """Config value, or the default when there is no config at all."""
+    try:
+        return sv.get(key, default)
+    except SystemExit:
+        return default
+
+
+def script_path():
+    if os.environ.get("SIEVE_MAIN"):
+        return os.path.expanduser(os.environ["SIEVE_MAIN"])
+    return os.path.join(os.path.expanduser(cfg("rules.repo", "~/sieve")), cfg("rules.script", "main.sieve"))
+
+
+def maildir():
+    return os.path.expanduser(os.environ.get("SIEVE_MAILDIR") or cfg("mail.maildir", "~/Mail"))
+
+
+URGENT = cfg("rules.urgent_folder", "Urgent")
+CLASS_VAR = cfg("rules.class_var", "why").lower()
+SVC_VAR = cfg("rules.service_var", "svc").lower()
+# The archive folder (mail.archive_folder; doctor reads it from the server):
+# its mail counts as history (when a sender or a service first wrote), never
+# as mail a rule should move. "" = none.
+ARCHIVE = cfg("mail.archive_folder", "")
+# Not routing outputs. Urgent IS replayed: it holds originals (a move).
+NOT_ROUTED = set(cfg("rules.not_routed", [])) | {cfg("mail.trash_folder", ""), cfg("mail.junk_folder", ""), ARCHIVE}
+NOT_ROUTED.discard("")
+# Replay-only pins for mail whose history no longer matches a rule (e.g. a
+# rule retired because the sender now routes it upstream): first match wins.
+PINS = cfg("rules.pin", [])
+
+
+class SieveError(SystemExit):
+    pass
+
+
+# --------------------------------------------------------------------------
+# Lexer and parser
+# --------------------------------------------------------------------------
+
+_TOKEN = re.compile(r"""
+    (?P<ws>\s+|\#[^\n]*|/\*.*?\*/)
+  | (?P<text>text:[ \t]*(?:\#[^\n]*)?\r?\n(?P<tbody>.*?)\r?\n\.\r?(?:\n|$))
+  | (?P<str>"(?:\\.|[^"\\])*")
+  | (?P<tag>:[A-Za-z_][A-Za-z0-9_]*)
+  | (?P<num>\d+[KMGkmg]?)
+  | (?P<id>[A-Za-z_][A-Za-z0-9_]*)
+  | (?P<punct>[\[\](),;{}])
+""", re.S | re.X)
+
+
+def _unquote(s):
+    out, i = [], 1
+    while i < len(s) - 1:
+        if s[i] == "\\" and i + 1 < len(s) - 1:
+            i += 1
+        out.append(s[i])
+        i += 1
+    return "".join(out)
+
+
+def lex(src, path):
+    toks, pos, line = [], 0, 1
+    while pos < len(src):
+        m = _TOKEN.match(src, pos)
+        if not m:
+            raise SieveError(f"sieve-sim: {path}:{line}: cannot read {src[pos:pos + 30]!r}")
+        kind = m.lastgroup if m.lastgroup != "tbody" else "text"
+        if m.group("text") is not None:
+            body = re.sub(r"(?m)^\.\.", ".", m.group("tbody"))
+            toks.append(("str", body, line))
+        elif kind == "str":
+            toks.append(("str", _unquote(m.group(0)), line))
+        elif kind != "ws":
+            toks.append((kind, m.group(0), line))
+        line += m.group(0).count("\n")
+        pos = m.end()
+    toks.append(("eof", "", line))
+    return toks
+
+
+class Node:
+    __slots__ = ("name", "args", "tests", "block", "line")
+
+    def __init__(self, name, args, tests, block, line):
+        self.name, self.args, self.tests, self.block, self.line = name, args, tests, block, line
+
+
+class Parser:
+    def __init__(self, toks, path):
+        self.t, self.i, self.path = toks, 0, path
+
+    def peek(self):
+        return self.t[self.i]
+
+    def take(self, kind=None, value=None):
+        tok = self.t[self.i]
+        if (kind and tok[0] != kind) or (value and tok[1] != value):
+            want = value or kind
+            raise SieveError(f"sieve-sim: {self.path}:{tok[2]}: expected {want!r}, found {tok[1]!r}")
+        self.i += 1
+        return tok
+
+    def commands(self, until="eof"):
+        out = []
+        while not (self.peek()[0] == until or self.peek()[1] == until):
+            out.append(self.command())
+        return out
+
+    def arguments(self):
+        args = []
+        while True:
+            k, v, _ = self.peek()
+            if k == "str":
+                args.append([self.take()[1]])
+            elif v == "[":
+                self.take()
+                items = [self.take("str")[1]]
+                while self.peek()[1] == ",":
+                    self.take()
+                    items.append(self.take("str")[1])
+                self.take(value="]")
+                args.append(items)
+            elif k == "num":
+                n = self.take()[1]
+                mult = {"k": 1024, "m": 1024 ** 2, "g": 1024 ** 3}.get(n[-1].lower(), 1)
+                args.append(int(n.rstrip("KMGkmg")) * mult)
+            elif k == "tag":
+                args.append(self.take()[1].lower())
+            else:
+                return args
+
+    def test(self):
+        _, name, line = self.take("id")
+        args = self.arguments()
+        tests = None
+        if self.peek()[1] == "(":
+            self.take()
+            tests = [self.test()]
+            while self.peek()[1] == ",":
+                self.take()
+                tests.append(self.test())
+            self.take(value=")")
+        elif self.peek()[0] == "id":
+            tests = [self.test()]
+        return Node(name.lower(), args, tests, None, line)
+
+    def command(self):
+        _, name, line = self.take("id")
+        name = name.lower()
+        args, tests, block = [], None, None
+        if name in ("if", "elsif"):
+            tests = [self.test()]
+        else:
+            args = self.arguments()
+        if self.peek()[1] == "{":
+            self.take()
+            block = self.commands(until="}")
+            self.take(value="}")
+        else:
+            self.take(value=";")
+        return Node(name, args, tests, block, line)
+
+
+# --------------------------------------------------------------------------
+# Matching
+# --------------------------------------------------------------------------
+
+def _fold_ascii(s):
+    """i;ascii-casemap: fold case for ASCII letters only, like the server."""
+    return "".join(ch.lower() if ch.isascii() else ch for ch in s)
+
+
+COMPARATORS = {
+    "i;ascii-casemap": _fold_ascii,
+    "i;octet": lambda s: s,
+    "i;unicode-casemap": str.casefold,
+}
+
+
+def _glob(pattern):
+    """Sieve :matches pattern -> regex. * and ? capture; backslash escapes."""
+    out, i = [], 0
+    while i < len(pattern):
+        ch = pattern[i]
+        if ch == "\\" and i + 1 < len(pattern):
+            i += 1
+            out.append(re.escape(pattern[i]))
+        elif ch == "*":
+            out.append("(.*)")
+        elif ch == "?":
+            out.append("(.)")
+        else:
+            out.append(re.escape(ch))
+        i += 1
+    return re.compile("^" + "".join(out) + "$", re.S)
+
+
+_GLOBS = {}
+_REGEX = {}
+
+
+def _regex(pattern, comparator):
+    """A :regex key, compiled. The server reads POSIX extended regex and this
+    replay reads Python's; where the two differ, refuse instead of guessing."""
+    rx = _REGEX.get((pattern, comparator))
+    if rx is None:
+        if "[:" in pattern:
+            raise SieveError(f"sieve-sim: :regex {pattern!r} uses a POSIX class ([:digit:], ...) that the "
+                             "replay would never match: write the class out ([0-9])")
+        try:
+            rx = re.compile(pattern, re.S | (re.I if comparator != "i;octet" else 0))
+        except re.error as e:
+            raise SieveError(f"sieve-sim: :regex {pattern!r} cannot be replayed: {e}")
+        _REGEX[(pattern, comparator)] = rx
+    return rx
+
+
+def match(mtype, comparator, values, keys):
+    """Return (matched key, match groups) or (None, None)."""
+    fold = COMPARATORS.get(comparator)
+    if fold is None:
+        raise SieveError(f"sieve-sim: comparator {comparator!r} is not supported")
+    for v in values:
+        fv = fold(v)
+        for k in keys:
+            fk = fold(k)
+            if mtype == ":is":
+                if fv == fk:
+                    return k, None
+            elif mtype == ":contains":
+                if fk in fv:
+                    return k, None
+            elif mtype == ":matches":
+                rx = _GLOBS.get(fk)
+                if rx is None:
+                    rx = _GLOBS[fk] = _glob(fk)
+                # Groups come from the original value, so a :lower set keeps
+                # working on the real text (the fold is per character).
+                m = rx.match(fv)
+                if m:
+                    groups, pos = [v], 0
+                    for gi in range(1, (m.lastindex or 0) + 1):
+                        s, e = m.span(gi)
+                        groups.append(v[s:e])
+                    return k, groups
+            elif mtype == ":regex":
+                m = _regex(k, comparator).search(v)
+                if m:
+                    return k, [m.group(0)] + list(m.groups(default=""))
+            else:
+                raise SieveError(f"sieve-sim: match type {mtype!r} is not supported")
+    return None, None
+
+
+def _split_tags(node, allowed):
+    """Split a test's arguments into tags and positional values."""
+    mtype, comparator, part, rest, i = ":is", "i;ascii-casemap", ":all", [], 0
+    args = node.args
+    while i < len(args):
+        a = args[i]
+        if isinstance(a, str) and a.startswith(":"):
+            if a in (":is", ":contains", ":matches", ":regex"):
+                mtype = a
+            elif a == ":comparator":
+                i += 1
+                comparator = args[i][0].lower()
+            elif a in (":all", ":localpart", ":domain") and "part" in allowed:
+                part = a
+            elif a in (":over", ":under") and "size" in allowed:
+                rest.append(a)
+            else:
+                raise SieveError(f"sieve-sim: line {node.line}: {node.name} {a} is not supported")
+        else:
+            rest.append(a)
+        i += 1
+    return mtype, comparator, part, rest
+
+
+# --------------------------------------------------------------------------
+# The interpreter
+# --------------------------------------------------------------------------
+
+_VAR = re.compile(r"\$\{([A-Za-z0-9_.]+)\}")
+
+
+class Run:
+    def __init__(self, msg, size):
+        self.msg, self.size = msg, size
+        self.vars, self.mvars = {}, []
+        self.files = []          # (folder, line, copy)
+        self.implicit_keep, self.explicit_keep = True, False
+        self.stopped = False
+        self.cls_key = ""        # the key behind the last set of the class var
+        self.keys = [""]         # key of each enclosing if-condition
+
+    def expand(self, s):
+        def sub(m):
+            name = m.group(1)
+            if name.isdigit():
+                n = int(name)
+                return self.mvars[n] if n < len(self.mvars) else ""
+            if "." in name:
+                return m.group(0)
+            return self.vars.get(name.lower(), "")
+        return _VAR.sub(sub, s) if "${" in s else s
+
+    def headers(self, names):
+        out = []
+        for name in names:
+            try:
+                vals = self.msg.get_all(name) or []
+            except Exception:
+                vals = []
+            for v in vals:
+                try:
+                    out.append(" ".join(str(v).split()))
+                except Exception:
+                    pass
+        return out
+
+    def test(self, node):
+        """Evaluate a test. Returns the matched key ("" when true without one) or None."""
+        n = node.name
+        if n == "true":
+            return ""
+        if n == "false":
+            return None
+        if n == "not":
+            return None if self.test(node.tests[0]) is not None else ""
+        if n == "allof":
+            first = None
+            for t in node.tests:
+                k = self.test(t)
+                if k is None:
+                    return None
+                first = k if first is None else first
+            return first or ""
+        if n == "anyof":
+            for t in node.tests:
+                k = self.test(t)
+                if k is not None:
+                    return k
+            return None
+        if n == "exists":
+            names = [self.expand(x) for x in node.args[0]]
+            return "" if all(self.headers([h]) or self._has(h) for h in names) else None
+        if n == "size":
+            _, _, _, rest = _split_tags(node, ("size",))
+            op, limit = rest[0], rest[1]
+            return "" if (self.size > limit if op == ":over" else self.size < limit) else None
+        if n in ("header", "address", "string"):
+            mtype, comp, part, rest = _split_tags(node, ("part",) if n == "address" else ())
+            if len(rest) != 2:
+                raise SieveError(f"sieve-sim: line {node.line}: cannot read the {n} test")
+            first = [self.expand(x) for x in rest[0]]
+            keys = [self.expand(x) for x in rest[1]]
+            if n == "header":
+                values = self.headers(first)
+            elif n == "string":
+                values = first
+            else:
+                values = []
+                for raw in self.headers(first):
+                    for _, a in email.utils.getaddresses([raw]):
+                        if not a:
+                            continue
+                        local, at, dom = a.rpartition("@")
+                        if not at:
+                            local, dom = a, ""
+                        values.append(a if part == ":all" else local if part == ":localpart" else dom)
+            key, groups = match(mtype, comp, values, keys)
+            if key is None:
+                return None
+            if groups is not None:
+                self.mvars = groups[:10]
+            return key
+        raise SieveError(f"sieve-sim: line {node.line}: test '{n}' is not supported "
+                         "(rewrite the rule; see sieve-sim --help)")
+
+    def _has(self, name):
+        try:
+            return name in self.msg
+        except Exception:
+            return False
+
+    def run(self, nodes):
+        chain = False
+        for node in nodes:
+            if self.stopped:
+                return
+            n = node.name
+            if n == "if" or (n == "elsif" and not chain):
+                key = self.test(node.tests[0])
+                chain = key is not None
+                if chain:
+                    self.keys.append(key)
+                    self.run(node.block)
+                    self.keys.pop()
+                continue
+            if n == "elsif":
+                continue
+            if n == "else":
+                if not chain:
+                    self.run(node.block)
+                chain = True
+                continue
+            chain = False
+            if n == "require":
+                continue
+            if n == "set":
+                mods = [a for a in node.args if isinstance(a, str)]
+                vals = [a for a in node.args if isinstance(a, list)]
+                name, value = vals[0][0].lower(), self.expand(vals[1][0])
+                if ":lower" in mods:
+                    value = value.lower()
+                if ":upper" in mods:
+                    value = value.upper()
+                if ":lowerfirst" in mods:
+                    value = value[:1].lower() + value[1:]
+                if ":upperfirst" in mods:
+                    value = value[:1].upper() + value[1:]
+                if ":quotewildcard" in mods:
+                    value = re.sub(r"([*?\\])", r"\\\1", value)
+                if ":length" in mods:
+                    value = str(len(value))
+                self.vars[name] = value
+                if name == CLASS_VAR:
+                    self.cls_key = self.keys[-1] if value else ""
+                continue
+            if n == "fileinto":
+                tags = [a for a in node.args if isinstance(a, str)]
+                strs = [a for a in node.args if isinstance(a, list)]
+                if ":flags" in tags:
+                    strs = strs[1:]
+                folder = self.expand(strs[-1][0])
+                self.files.append((folder, node.line, ":copy" in tags))
+                if ":copy" not in tags:
+                    self.implicit_keep = False
+                continue
+            if n == "keep":
+                self.explicit_keep = True
+                continue
+            if n == "discard":
+                self.implicit_keep = False
+                self.files.append(("(discarded)", node.line, False))
+                continue
+            if n == "redirect":
+                if ":copy" not in [a for a in node.args if isinstance(a, str)]:
+                    self.implicit_keep = False
+                continue
+            if n == "stop":
+                self.stopped = True
+                return
+            if n in ("addflag", "setflag", "removeflag", "vacation", "notify"):
+                continue
+            raise SieveError(f"sieve-sim: line {node.line}: command '{n}' is not supported "
+                             "(rewrite the rule; see sieve-sim --help)")
+
+
+_COMMANDS = {"require", "if", "elsif", "else", "set", "fileinto", "keep", "discard", "redirect", "stop",
+             "addflag", "setflag", "removeflag", "vacation", "notify"}
+_SET_MODIFIERS = {":lower", ":upper", ":lowerfirst", ":upperfirst", ":quotewildcard", ":length"}
+_FILEINTO_TAGS = {":create", ":copy", ":flags"}
+
+
+def _validate_test(node):
+    n = node.name
+    if n in ("true", "false"):
+        return
+    if n in ("not", "allof", "anyof"):
+        if not node.tests:
+            raise SieveError(f"sieve-sim: line {node.line}: '{n}' needs a test")
+        for t in node.tests:
+            _validate_test(t)
+        return
+    if n == "exists":
+        if not (node.args and isinstance(node.args[0], list)):
+            raise SieveError(f"sieve-sim: line {node.line}: cannot read the exists test")
+        return
+    if n == "size":
+        _, _, _, rest = _split_tags(node, ("size",))
+        if len(rest) != 2 or rest[0] not in (":over", ":under") or not isinstance(rest[1], int):
+            raise SieveError(f"sieve-sim: line {node.line}: cannot read the size test")
+        return
+    if n in ("header", "address", "string"):
+        mtype, comp, _part, rest = _split_tags(node, ("part",) if n == "address" else ())
+        if len(rest) != 2 or not all(isinstance(x, list) for x in rest):
+            raise SieveError(f"sieve-sim: line {node.line}: cannot read the {n} test")
+        if comp not in COMPARATORS:
+            raise SieveError(f"sieve-sim: line {node.line}: comparator {comp!r} is not supported")
+        if mtype == ":regex":
+            for key in rest[1]:
+                if "${" not in key:
+                    _regex(key, comp)
+        return
+    raise SieveError(f"sieve-sim: line {node.line}: test '{n}' is not supported "
+                     "(rewrite the rule; see sieve-sim --help)")
+
+
+def validate(nodes):
+    """Refuse whatever the interpreter cannot run, wherever it stands in the
+    script. Running finds only the rules some message reaches; a rule no
+    archived mail meets would otherwise pass every replay and still be wrong."""
+    prev = None
+    for node in nodes:
+        n = node.name
+        if n not in _COMMANDS:
+            raise SieveError(f"sieve-sim: line {node.line}: command '{n}' is not supported "
+                             "(rewrite the rule; see sieve-sim --help)")
+        if n in ("elsif", "else") and prev not in ("if", "elsif"):
+            raise SieveError(f"sieve-sim: line {node.line}: '{n}' without an 'if' before it")
+        if n in ("if", "elsif"):
+            _validate_test(node.tests[0])
+        if n in ("if", "elsif", "else") and node.block is None:
+            raise SieveError(f"sieve-sim: line {node.line}: '{n}' needs a {{ block }}")
+        if n == "set":
+            mods = [a for a in node.args if isinstance(a, str)]
+            vals = [a for a in node.args if isinstance(a, list)]
+            unknown = [m for m in mods if m not in _SET_MODIFIERS]
+            if unknown or len(vals) != 2:
+                raise SieveError(f"sieve-sim: line {node.line}: set {' '.join(unknown) or '(arguments)'} "
+                                 "is not supported")
+        if n == "fileinto":
+            tags = [a for a in node.args if isinstance(a, str)]
+            unknown = [t for t in tags if t not in _FILEINTO_TAGS]
+            if unknown or not any(isinstance(a, list) for a in node.args):
+                raise SieveError(f"sieve-sim: line {node.line}: fileinto {' '.join(unknown) or '(no folder)'} "
+                                 "is not supported")
+        if node.block is not None:
+            validate(node.block)
+        prev = n
+
+
+class Script:
+    """A parsed Sieve script, ready to run over messages."""
+
+    def __init__(self, path):
+        self.path = path
+        src = open(path, encoding="utf-8").read()
+        self.nodes = Parser(lex(src, path), path).commands()
+        validate(self.nodes)
+        # Section names from "# ---- NAME" comment lines, for readable reasons.
+        self.sections = []
+        for no, line in enumerate(src.splitlines(), 1):
+            m = re.match(r"#\s*-{3,}\s*([A-Za-z][\w-]*)", line)
+            if m:
+                self.sections.append((no, m.group(1)))
+
+    def section(self, line):
+        name = ""
+        for no, s in self.sections:
+            if no > line:
+                break
+            name = s
+        return name
+
+    def run(self, msg, size=0):
+        r = Run(msg, size)
+        r.run(self.nodes)
+        return r
+
+
+UrgentRules = Script     # the name older callers use
+
+
+def _pin(msg):
+    for i, p in enumerate(PINS):
+        try:
+            v = str(msg.get(p["header"], "") or "")
+        except Exception:
+            v = ""
+        if p.get("contains", "\0") in v:
+            return p["folder"], f"pin:{i}"
+    return None
+
+
+def outcome(msg, rules=None, size=0):
+    """Run the script on one message.
+
+    Returns (folder, svc, reason, urgent class, key behind the class). The
+    folder is the first fileinto without :copy, else the first fileinto, else
+    INBOX (implicit keep). reason is "urgent:<class>", "<SECTION>:L<line>",
+    "keep" or "pin:<n>".
+    """
+    return outcome_all(msg, rules, size)[0]
+
+
+def outcome_all(msg, rules=None, size=0):
+    """outcome(), plus the other folders the server would ALSO deliver to.
+
+    Two fileinto without :copy in one run (a block that forgot its "stop")
+    leave a copy in each folder, and so does a keep next to a fileinto. The
+    replay reports one folder per message; the extra ones are returned here so
+    the reports can point at the rule that is missing its stop.
+    """
+    rules = rules or default_script()
+    pinned = _pin(msg)
+    if pinned:
+        return (pinned[0], "", pinned[1], "", ""), []
+    r = rules.run(msg, size)
+    svc = r.vars.get(SVC_VAR, "")
+    moves = [(f, line) for f, line, copy in r.files if not copy]
+    if moves:
+        folder, line = moves[0]
+    elif r.files:
+        folder, line = r.files[0][0], r.files[0][1]
+    else:
+        folder, line = "INBOX", 0
+    also = []
+    for f, _line in moves[1:] + ([("INBOX", 0)] if r.explicit_keep and moves else []):
+        if f != folder and f not in also and "(discarded)" not in (f, folder):
+            also.append(f)
+    if folder == URGENT:
+        cls = r.vars.get(CLASS_VAR, "")
+        return (folder, svc, f"urgent:{cls}", cls, r.cls_key), also
+    reason = f"{rules.section(line) or 'rule'}:L{line}" if line else "keep"
+    return (folder, svc, reason, "", ""), also
+
+
+def classify(msg, rules=None, size=0):
+    """Return (folder, svc, reason) for one message (headers are enough)."""
+    return outcome(msg, rules, size)[:3]
+
+
+_DEFAULT = None
+
+
+def default_script():
+    global _DEFAULT
+    if _DEFAULT is None:
+        _DEFAULT = Script(script_path())
+    return _DEFAULT
+
+
+def live_script():
+    """Path to the script as deployed: origin/<branch> of rules.repo, in the cache."""
+    repo = os.path.expanduser(cfg("rules.repo", ""))
+    branch = cfg("rules.branch", "main")
+    name = cfg("rules.script", "main.sieve")
+    fetch = subprocess.run(["git", "-C", repo, "fetch", "-q", "origin"], capture_output=True, text=True)
+    if fetch.returncode:
+        why = (fetch.stderr.strip().splitlines() or ["no output"])[-1]
+        print(f"sieve-sim: warning: could not fetch origin in {repo} ({why}); "
+              f"using origin/{branch} as last fetched", file=sys.stderr)
+    out = subprocess.run(["git", "-C", repo, "show", f"origin/{branch}:{name}"],
+                         capture_output=True, text=True)
+    if out.returncode:
+        raise SieveError(f"sieve-sim: cannot read origin/{branch}:{name} in {repo} "
+                         "(the rules repo needs a remote named origin whose branch holds the live script)")
+    # Several checks call this at once (doctor runs them in parallel): write
+    # beside the file and swap it in, so nobody ever reads half a script.
+    path = sv.cache() / "live.sieve"
+    tmp = path.with_name(f"live.sieve.{os.getpid()}.tmp")
+    tmp.write_text(out.stdout, encoding="utf-8")
+    os.replace(tmp, path)
+    return str(path)
+
+
+# --------------------------------------------------------------------------
+# Loading the archive
+# --------------------------------------------------------------------------
+
+def h(msg, name):
+    try:
+        v = msg.get(name)
+    except Exception:
+        return ""
+    return str(v) if v is not None else ""
+
+
+def addrs(value):
+    return [_fold_ascii(a) for _, a in email.utils.getaddresses([value]) if a]
+
+
+def norm(subject):
+    s = re.sub(r"^((re|fw|fwd):\s*)+", "", subject.strip(), flags=re.I)
+    return re.sub(r"\d+", "#", s)
+
+
+def folders_on_disk():
+    root = maildir()
+    return sorted(n for n in os.listdir(root) if os.path.isdir(os.path.join(root, n, "cur")))
+
+
+def files_in(folder):
+    for sub in ("cur", "new"):
+        d = os.path.join(maildir(), folder, sub)
+        if os.path.isdir(d):
+            for fn in os.listdir(d):
+                yield os.path.join(d, fn)
+
+
+def load(rules, with_archive=True, other=None):
+    """One row per message: where it is, where the script would file it.
+
+    other: a second Script; its prediction goes in pred_other / urgent_other.
+    """
+    rows = []
+    for folder in folders_on_disk():
+        if folder in NOT_ROUTED and not (with_archive and folder == ARCHIVE):
+            continue
+        for path in files_in(folder):
+            try:
+                with open(path, "rb") as fh:
+                    msg = HDR.parse(fh)
+                size = os.path.getsize(path)
+            except Exception:
+                continue
+            (pred, svc, reason, cls, key), also = outcome_all(msg, rules, size)
+            subject = " ".join(h(msg, "Subject").split())
+            froms = addrs(h(msg, "From"))
+            # An alias service rewrites From; the sender the user knows is in
+            # the service's own header (lib/aliases/).
+            shown = addrs(sv.real_sender(msg, display=True)) or froms
+            try:
+                date = email.utils.parsedate_to_datetime(h(msg, "Date")).strftime("%Y-%m-%d")
+            except Exception:
+                date = ""
+            row = {
+                "actual": folder, "pred": pred, "svc": svc, "why": reason,
+                "urgent": cls, "key": key, "path": path, "date": date,
+                "subject": subject, "sender": shown[0] if shown else "",
+                "frm": h(msg, "From")[:46], "env": h(msg, "X-Envelope-To")[:40],
+                "mid": h(msg, "Message-ID").strip(),
+                "bulk": bool(h(msg, "List-Unsubscribe")),
+                "also": also,
+            }
+            if other is not None:
+                p2, _s2, _r2, c2, _k2 = outcome(msg, other, size)
+                row["pred_other"], row["urgent_other"] = p2, c2
+            rows.append(row)
+    return rows
+
+
+def urgent_folder_ids():
+    """Message-ID -> (date, sender, subject) for what is really in Urgent."""
+    out = {}
+    for path in files_in(URGENT):
+        try:
+            with open(path, "rb") as fh:
+                msg = HDR.parse(fh)
+        except Exception:
+            continue
+        try:
+            date = email.utils.parsedate_to_datetime(h(msg, "Date")).strftime("%Y-%m-%d")
+        except Exception:
+            date = ""
+        shown = addrs(sv.real_sender(msg, display=True)) or addrs(h(msg, "From"))
+        out[h(msg, "Message-ID").strip()] = (date, shown[0] if shown else "",
+                                             " ".join(h(msg, "Subject").split()))
+    return out
+
+
+# Wording that suggests "act now" in a mail the subject rules let through.
+# It is the user's own, in their languages: the lane-urgent skill learns it
+# from their mail and keeps one regex per line in
+# $SVETOVID_HOME/lane-urgent/body-phrases.txt (# starts a comment). None are
+# built in; with no file the audit simply has no B flag.
+_PHRASES = False     # not read yet
+_TAGS = re.compile(r"<(style|script)[^>]*>.*?</\1>", re.S | re.I)
+
+
+def body_phrases():
+    """The learned phrases as one regex, or None when there are none yet."""
+    global _PHRASES
+    if _PHRASES is False:
+        path = sv.home() / "lane-urgent" / "body-phrases.txt"
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (FileNotFoundError, SystemExit):
+            lines = []
+        good = []
+        for no, line in enumerate(lines, 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                re.compile(line)
+                good.append(f"(?:{line})")
+            except re.error as e:
+                raise SieveError(f"sieve-sim: {path}:{no}: not a regular expression ({e})")
+        _PHRASES = re.compile("|".join(good), re.I) if good else None
+    return _PHRASES
+
+
+def body_smell(path):
+    """First learned urgent-looking phrase in the opening of the body, or ""."""
+    phrases = body_phrases()
+    if phrases is None:
+        return ""
+    try:
+        with open(path, "rb") as fh:
+            msg = email.message_from_binary_file(fh, policy=email.policy.default)
+        plain = htm = None
+        for part in msg.walk():
+            if part.get_content_disposition() == "attachment":
+                continue
+            ct = part.get_content_type()
+            if ct == "text/plain" and plain is None:
+                plain = part.get_content()
+            elif ct == "text/html" and htm is None:
+                htm = part.get_content()
+        text = plain if plain and len(plain.strip()) > 40 else None
+        if text is None and htm:
+            text = html.unescape(re.sub(r"<[^>]+>", " ", _TAGS.sub(" ", htm)))
+        text = " ".join((text or plain or "").split())
+    except Exception:
+        return ""
+    # an alias service puts its own banner on top of every forward
+    text = sv.strip_alias_banner(text)
+    m = phrases.search(text[:700])
+    return m.group(0)[:24] if m else ""
+
+
+# --------------------------------------------------------------------------
+# Reports
+# --------------------------------------------------------------------------
+
+def print_urgent(rows, limit=None):
+    groups = defaultdict(list)
+    for r in rows:
+        if r["urgent"]:
+            groups[(r["urgent"], r["pred"], r["sender"], norm(r["subject"])[:70], r["key"])].append(r)
+    by_class = Counter(r["urgent"] for r in rows if r["urgent"])
+    print("  " + "  ".join(f"{c}={n}" for c, n in by_class.most_common())
+          + f"   total {sum(by_class.values())} of {len(rows)}")
+    shown = 0
+    for (cls, folder, sender, subj, key), v in sorted(groups.items()):
+        if limit and shown >= limit:
+            print(f"  ... {len(groups) - shown} more groups (-n 0 for all)")
+            break
+        print(f"  {cls:<9}{len(v):>3}  {folder[:14]:<14} [{key[:16]:<16}] {subj}")
+        shown += 1
+
+
+def report_audit(rows, since):
+    recent = [r for r in rows if r["date"] >= since and r["actual"] != ARCHIVE]
+    first_seen, first_folder = {}, {}
+    for r in rows:
+        if r["date"] and (r["sender"] not in first_seen or r["date"] < first_seen[r["sender"]]):
+            first_seen[r["sender"]] = r["date"]
+        if r["date"] and r["svc"] and (r["svc"] not in first_folder or r["date"] < first_folder[r["svc"]]):
+            first_folder[r["svc"]] = r["date"]
+
+    print("=" * 78)
+    print(f"A. FILED INTO {URGENT} since {since}  (check for false alarms)")
+    print("=" * 78)
+    print_urgent(recent)
+
+    print("\n" + "=" * 78)
+    print("B. NOT URGENT, service mail  (check for mail that slipped through)")
+    print("   flags: B body reads urgent   N sender never seen before   T not bulk")
+    print("          (no List-Unsubscribe)   most suspicious first")
+    if body_phrases() is None:
+        print("   no body phrases learned yet (lane-urgent/body-phrases.txt): no B flag in this report")
+    print("=" * 78)
+    groups = defaultdict(list)
+    for r in recent:
+        if r["svc"] and not r["urgent"]:
+            groups[(r["pred"], r["sender"], norm(r["subject"])[:64])].append(r)
+    scored = []
+    for (folder, sender, subj), v in groups.items():
+        smell = next((s for s in (body_smell(r["path"]) for r in v[:2]) if s), "")
+        new = first_seen.get(sender, "") >= since
+        trans = not any(r["bulk"] for r in v)
+        score = (4 if smell else 0) + (2 if trans else 0) + (1 if new else 0)
+        flags = ("B" if smell else "-") + ("N" if new else "-") + ("T" if trans else "-")
+        scored.append((-score, folder, sender, subj, flags, len(v), smell))
+    for _, folder, sender, subj, flags, n, smell in sorted(scored):
+        tail = f"   <<{smell}>>" if smell else ""
+        print(f"  {flags} {n:>3}  {folder[:13]:<13} {sender[:30]:<30} {subj}{tail}")
+    print(f"  {len(scored)} groups, {sum(s[5] for s in scored)} messages")
+
+    print("\n" + "=" * 78)
+    print(f"C. NEW SERVICES since {since}  (never checked against the rules)")
+    print("=" * 78)
+    fresh = sorted(s for s, d in first_folder.items() if d >= since)
+    for svc in fresh:
+        mine = [r for r in recent if r["svc"] == svc]
+        urg = sum(1 for r in mine if r["urgent"])
+        print(f"  {svc:<22} {len(mine):>3} mails, {urg} to {URGENT}")
+    if not fresh:
+        print("  none")
+
+    print("\n" + "=" * 78)
+    print(f"D. SERVER CHECK: the real {URGENT} folder against the prediction")
+    print("=" * 78)
+    real = urgent_folder_ids()
+    predicted = {r["mid"]: r for r in recent if r["urgent"] and r["mid"]}
+    known = {r["mid"]: r for r in rows if r["mid"]}
+    extra = [(mid, v) for mid, v in real.items() if v[0] >= since and mid not in predicted]
+    missing = [r for mid, r in predicted.items() if mid not in real]
+    print(f"  in {URGENT} since {since}: {sum(1 for v in real.values() if v[0] >= since)}"
+          f"   predicted: {len(predicted)}")
+    print(f"\n  in {URGENT} but NOT predicted: {len(extra)}"
+          "   (server and sieve-sim disagree, or the rule that moved it is gone)")
+    for mid, (date, sender, subj) in sorted(extra, key=lambda x: x[1]):
+        note = "" if mid in known else "  [original not in any folder]"
+        print(f"    {date} {sender[:30]:<30} {subj[:60]}{note}")
+    print(f"\n  predicted but NOT in {URGENT}: {len(missing)}"
+          "   (still in its service folder: arrived before the rule was\n"
+          "    deployed, so re-file it; or deleted by hand; or the server did\n"
+          "    not match: a whole kind missing, e.g. every Cyrillic subject,\n"
+          "    means the server reads the rule differently)")
+    for r in sorted(missing, key=lambda r: r["date"]):
+        print(f"    {r['date']} {r['urgent']:<9}{r['sender'][:28]:<28} {r['subject'][:56]}")
+
+
+def report_twice(rows):
+    """Messages the script would deliver to more than one folder."""
+    twice = Counter((r["pred"], " + ".join(r["also"]), r["why"]) for r in rows if r.get("also"))
+    if not twice:
+        return
+    print(f"\n!! delivered to more than one folder: {sum(twice.values())}   "
+          '(a rule is missing its "stop": the server leaves a copy in each)')
+    for (pred, also, why), n in sorted(twice.items(), key=lambda x: -x[1])[:20]:
+        print(f"  {n:>4}  {pred} + {also}   first filed by {why}")
+
+
+def report_diff(rows, old_path, new_path):
+    print(f"old: {old_path}\nnew: {new_path}\n")
+    moved = Counter()
+    for r in rows:
+        if r["pred_other"] != r["pred"] or r["urgent_other"] != r["urgent"]:
+            was = r["pred_other"] + (f" ({r['urgent_other']})" if r["urgent_other"] else "")
+            now = r["pred"] + (f" ({r['urgent']})" if r["urgent"] else "")
+            moved[(was, now, r["sender"][:28], norm(r["subject"])[:56])] += 1
+    print(f"messages filed differently: {sum(moved.values())}")
+    plus = {k: v for k, v in moved.items() if k[1].startswith(URGENT)}
+    minus = {k: v for k, v in moved.items() if k[0].startswith(URGENT) and not k[1].startswith(URGENT)}
+    other = {k: v for k, v in moved.items() if k not in plus and k not in minus}
+    for title, part in ((f"+ newly into {URGENT}", plus), (f"- no longer into {URGENT}", minus),
+                        ("~ other folder changes", other)):
+        print(f"\n{title}: {sum(part.values())}")
+        for (was, now, sender, subj), n in sorted(part.items()):
+            print(f"  {n:>4}  {was[:24]:<24} -> {now[:24]:<24} {sender:<28} {subj}")
+    report_twice(rows)
+
+
+def explain(path, rules):
+    with open(path, "rb") as fh:
+        msg = HDR.parse(fh)
+    folder, svc, reason, cls, key = outcome(msg, rules, os.path.getsize(path))
+    r = rules.run(msg)
+    print(f"file:    {path}")
+    print(f"subject: {h(msg, 'Subject')[:90]}")
+    print(f"=> {folder}   ({reason})")
+    print(f"   {SVC_VAR}={svc!r}  {CLASS_VAR}={r.vars.get(CLASS_VAR, '')!r}" + (f"  key={key!r}" if key else ""))
+    for f, line, copy in r.files:
+        print(f"   fileinto {f!r} at line {line}{' :copy' if copy else ''}  [{rules.section(line)}]")
+    print("   variables: " + ", ".join(f"{k}={v!r}" for k, v in sorted(r.vars.items())))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--show", help="sample messages predicted into this folder")
+    ap.add_argument("--moved", action="store_true", help="only changed messages")
+    ap.add_argument("--urgent", action="store_true", help="what would be filed into Urgent, grouped")
+    ap.add_argument("--audit", action="store_true", help="Urgent maintenance report (needs --since)")
+    ap.add_argument("--diff", metavar="OLD.sieve", help="every message OLD.sieve files differently")
+    ap.add_argument("--explain", metavar="FILE", help="trace one message file")
+    ap.add_argument("--live", action="store_true", help="use the deployed script (origin/<branch>)")
+    ap.add_argument("--check", action="store_true",
+                    help="exit 0 if every rule in the script can be replayed (nothing is run)")
+    ap.add_argument("--since", metavar="YYYY-MM-DD", default="", help="only mail dated D or later")
+    ap.add_argument("-n", type=int, default=20)
+    args = ap.parse_args()
+
+    if args.since and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.since):
+        ap.error("--since wants YYYY-MM-DD")
+    if args.audit and not args.since:
+        ap.error("--audit needs --since YYYY-MM-DD (the date of the last audit)")
+
+    path = live_script() if args.live else script_path()
+    rules = Script(path)
+    if args.check:
+        print(f"sieve-sim: {path}: {len(rules.nodes)} top-level commands, all executable")
+        return 0
+    if args.explain:
+        explain(args.explain, rules)
+        return 0
+
+    other = Script(args.diff) if args.diff else None
+    rows = load(rules, other=other)
+    if not rows:
+        print("no messages", file=sys.stderr)
+        return 1
+    live = [r for r in rows if r["actual"] != ARCHIVE]
+
+    if args.audit:
+        report_audit(rows, args.since)
+        return 0
+    if args.diff:
+        report_diff([r for r in live if r["date"] >= args.since], args.diff, path)
+        return 0
+    if args.urgent:
+        sel = [r for r in live if r["date"] >= args.since]
+        print(f"would be filed into {URGENT}{' since ' + args.since if args.since else ''}:")
+        print_urgent(sel, limit=None)
+        return 0
+    if args.show:
+        sel = [r for r in rows if r["pred"] == args.show]
+        print(f"{len(sel)} messages predicted -> {args.show}\n")
+        for r in sel[: args.n or None]:
+            print(f"  [{r['actual']:>12} -> {r['pred']:<14}] {r['why']}"
+                  + (f"   URGENT:{r['urgent']}" if r["urgent"] else ""))
+            print(f"       {r['frm']}")
+            print(f"       {r['subject'][:70]}")
+        return 0
+    if args.moved:
+        sel = [r for r in live if r["actual"] != r["pred"]]
+        print(f"{len(sel)} of {len(live)} would change folder\n")
+        for r in sel[: args.n or None]:
+            print(f"  {r['actual']:>12} -> {r['pred']:<14} {r['why']:<24} {r['subject'][:44]}")
+        return 0
+
+    print("=" * 78)
+    print("PER SOURCE  (where it is now -> where the script would put it)")
+    print("=" * 78)
+    by_src = defaultdict(Counter)
+    for r in rows:
+        by_src[r["actual"]][r["pred"]] += 1
+    settled = 0
+    for src in sorted(by_src):
+        c = by_src[src]
+        total = sum(c.values())
+        stay = c.get(src, 0)
+        if stay == total:
+            settled += 1
+            continue
+        top = ", ".join(f"{k}={v}" for k, v in c.most_common(6) if k != src)
+        print(f"  {src:<14}{total:>6}   stay {stay:>5}   move {total - stay:>5}   -> {top}")
+    print(f"  {settled} folders where every message is already in place")
+
+    print("\n" + "=" * 78)
+    print("DESTINATIONS")
+    print("=" * 78)
+    dest = Counter(r["pred"] for r in live)
+    for k, v in dest.most_common():
+        print(f"  {k:<28}{v:>6}")
+    print(f"  {'folders':<28}{len(dest):>6}")
+
+    same = sum(1 for r in live if r["actual"] == r["pred"])
+    urg = Counter(r["urgent"] for r in live if r["urgent"])
+    print(f"\nunchanged: {same}/{len(live)} ({same / len(live):.1%})")
+    print(f"urgent: {sum(urg.values())}   " + "  ".join(f"{c}={n}" for c, n in urg.most_common()))
+    report_twice(live)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""sieve-refile — run the rules again on mail already on the server.
+
+Delivery-time Sieve only sees new mail. After a rule change this re-files
+what already sits in one folder: every message's headers go through the
+same interpreter as sieve-sim, and a message whose predicted folder differs
+from FOLDER is moved there with IMAP UID MOVE. Moves only: never deletes,
+never changes flags.
+
+    sieve-refile example                   dry run: counts per destination
+    sieve-refile example --apply           move them
+    sieve-refile example --apply --create  also create missing target folders
+    sieve-refile example --apply --to INBOX only moves bound for INBOX (repeatable)
+    sieve-refile x --script other.sieve    classify with another script
+                                           (rules-refile passes the deployed one)
+
+Unread mail moved into Urgent makes the notifier announce it; for more than a
+handful use rules-refile --quiet-urgent, which pauses it.
+Settings: mail.address, mail.imap_host, mail.password_command.
+"""
+import argparse
+import importlib.machinery
+import os
+import re
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parents[2] / "lib"))
+import svetovid as sv  # noqa: E402
+
+sim = importlib.machinery.SourceFileLoader("sieve_sim", str(HERE / "sieve-sim")).load_module()
+
+
+def q(name):
+    return '"' + name.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def server_folders(m):
+    """Folder names on the server, whatever its hierarchy separator is."""
+    out = set()
+    for line in m.list()[1]:
+        if isinstance(line, tuple):                 # the name came as a literal
+            out.add(line[1].decode("utf-8", "replace"))
+            continue
+        mm = re.match(r'\((.*?)\) (?:"[^"]*"|NIL) (.*)$', line.decode("utf-8", "replace"))
+        if mm:
+            out.add(mm.group(2).strip().strip('"'))
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("folder")
+    ap.add_argument("--apply", action="store_true", help="move (default: dry run)")
+    ap.add_argument("--create", action="store_true", help="create missing target folders")
+    ap.add_argument("--to", action="append", metavar="FOLDER",
+                    help="only move mail bound for this folder (repeatable)")
+    ap.add_argument("--script", help="classify with this script (default: the checkout)")
+    ap.add_argument("--show", type=int, default=5, help="sample subjects per destination")
+    a = ap.parse_args()
+
+    rules = sim.Script(a.script or sim.script_path())
+    m = sv.imap()
+    if b"MOVE" not in m.capability()[1][0].upper():
+        sys.exit("sieve-refile: the server lacks IMAP MOVE")
+    typ, _ = m.select(q(a.folder))
+    if typ != "OK":
+        sys.exit(f"sieve-refile: cannot select {a.folder}")
+    uids = m.uid("SEARCH", None, "ALL")[1][0].split()
+    plan, samples = defaultdict(list), defaultdict(list)
+    for i in range(0, len(uids), 200):
+        typ, resp = m.uid("FETCH", b",".join(uids[i:i + 200]), "(UID RFC822.SIZE BODY.PEEK[HEADER])")
+        for item in resp:
+            if not isinstance(item, tuple):
+                continue
+            head = item[0].decode("ascii", "replace")
+            uid = head.split("UID ")[1].split()[0].encode()
+            size = int(head.split("RFC822.SIZE ")[1].split()[0]) if "RFC822.SIZE " in head else 0
+            msg = sim.HDR.parsebytes(item[1])
+            dest, _svc, why = sim.classify(msg, rules, size)
+            if dest != a.folder and (not a.to or dest in a.to):
+                plan[dest].append(uid)
+                samples[dest].append(f"{why:<22} {' '.join(str(msg.get('Subject', '')).split())[:70]}")
+    moving = sum(len(v) for v in plan.values())
+    print(f"{a.folder}: {len(uids)} messages, {moving} would move, {len(uids) - moving} stay")
+    for dest, us in sorted(plan.items(), key=lambda x: -len(x[1])):
+        print(f"  -> {dest}: {len(us)}")
+        for s in Counter(samples[dest]).most_common(a.show):
+            print(f"       {s[1]:>3}x {s[0]}")
+    if not a.apply:
+        print("dry run; --apply to move")
+        m.logout()
+        return 0
+    existing = server_folders(m)
+    missing = sorted(d for d in plan if d != "(discarded)" and d not in existing)
+    if missing and not a.create:       # before anything moves, so a refusal leaves nothing half done
+        sys.exit(f"sieve-refile: target {', '.join(missing)} does not exist (use --create); nothing moved")
+    for dest, us in plan.items():
+        if dest == "(discarded)":
+            print(f"skipped {len(us)} the script would discard")
+            continue
+        if dest in missing:
+            typ, r = m.create(q(dest))
+            if typ != "OK":
+                sys.exit(f"sieve-refile: cannot create {dest}: {r}")
+        for i in range(0, len(us), 100):
+            typ, r = m.uid("MOVE", b",".join(us[i:i + 100]), q(dest))
+            if typ != "OK":
+                sys.exit(f"sieve-refile: MOVE to {dest} failed: {r}")
+        print(f"moved {len(us)} -> {dest}")
+    m.select(q(a.folder))
+    print(f"{a.folder} now holds {len(m.uid('SEARCH', None, 'ALL')[1][0].split())}")
+    m.logout()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

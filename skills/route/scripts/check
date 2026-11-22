@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""check — route's health for doctor: no mail sits in a service folder that the
+deployed rules would file elsewhere (it arrived before its rule, or a re-file
+was skipped). One line per finding (OK/WARN), exit 0."""
+import importlib.machinery
+import sys
+from collections import Counter
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parents[2] / "lib"))
+import svetovid as sv  # noqa: E402
+
+sim = importlib.machinery.SourceFileLoader("sieve_sim", str(HERE.parents[1] / "mail-rules" / "scripts" / "sieve-sim")).load_module()
+rules = sim.Script(sim.live_script())
+rows = sim.load(rules, with_archive=False)
+stuck = Counter((r["actual"], r["pred"]) for r in rows
+                if sv.is_service_folder(r["actual"]) and r["pred"] != r["actual"])
+if not stuck:
+    print("OK   no service folder holds mail the deployed rules would file elsewhere")
+for (src, dst), n in sorted(stuck.items(), key=lambda x: -x[1]):
+    print(f"WARN {n} mail(s) in {src} the rules would file into {dst} (mail-rules: rules-refile {src} --to {dst})")

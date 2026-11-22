@@ -1,0 +1,694 @@
+#!/usr/bin/env python3
+"""deliv — helper for the lane-deliveries skill. Read-only on mail.
+
+The Deliveries lane: every web shop the user ordered from gets a folder (the
+[folders] deliveries template, per-service: <shop>-deliveries-rss) that the
+rules fill with that shop's order lifecycle (placed, paid, shipped, courier
+notices, delivered, cancelled). Each folder is a bridge channel in one hub
+tag, read as one reader feed.
+
+This tool finds what the rules do not cover yet. It never moves, flags or
+deletes mail and never edits rules; building is done with mail-rules
+(rules-start / rules-land / rules-refile) and feed-wiring (feeds), as the skill
+describes.
+
+  deliv sync                     sync the local copy (mail.sync_command)
+  deliv scan                     the run's report: NEW folders, CANDIDATE shops,
+                                 MISSED delivery mail at wired shops, REFILE
+                                 (rules cover it, mail not moved), DEFERRED
+  deliv show <svc|gN> [-n N] [--body]
+                                 every mail of one identity (all folders), or one
+                                 scan group; * = delivery-like, i = ignored
+  deliv set <svc> <wired|declined|deferred|none> [--words W] [--note N]
+                                 [--prefix P] [--title T]
+  deliv ignore add --svc S --kind K [--subject RE] [--from GLOB] [--words W]
+  deliv ignore list | rm In
+  deliv learn [-n N]             evidence for the vocabulary, from your own mail:
+                                 senders that reach several services, how mail
+                                 already in the feed is worded, subjects with
+                                 an order number that nothing recognises yet
+  deliv vocab list | add | rm [--subject RE ...] [--final RE ...]
+                                 [--courier DOMAIN ...] [--sender GLOB ...]
+                                 what counts as delivery mail (see below)
+  deliv check [--remote]         the shop lists in the deployed script and the
+                                 state agree; --remote: feeds + tag too
+  deliv need                     for doctor: one JSON line, is there work?
+  deliv done [--force] [--note N]
+                                 close the run: new folders without delivery
+                                 mail become `none`, last_scan is stamped
+
+The vocabulary. Which mail is "delivery-like" is learned from your mail and
+kept in your state; no word, language or courier is built in. Four lists:
+subject (regex: words that mark order and shipping mail), final (regex:
+words that end an order, e.g. delivered, cancelled), courier (sender domains
+of couriers and tracking services; the ones in the script's courier block
+count without being listed), sender (globs on the sender address). With an
+empty vocabulary nothing is recognised: run `deliv learn` first.
+
+State (private, never in git): $SVETOVID_DELIVERIES_STATE, default
+$SVETOVID_HOME/lane-deliveries/ (state.json, runs.md, notes.md).
+Scan groups: $SVETOVID_CACHE/lane-deliveries/last-scan.json.
+"""
+import argparse, collections, datetime as dt, email, email.policy, fnmatch, html, importlib.machinery
+import importlib.util, json, os, re, subprocess, sys, time
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+_HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE.parents[2] / "lib"))
+import svetovid as sv  # noqa: E402
+
+HOME = os.path.expanduser("~")
+STATE_DIR = os.path.expanduser(os.environ.get("SVETOVID_DELIVERIES_STATE") or str(sv.skill_home("lane-deliveries")))
+STATE = os.path.join(STATE_DIR, "state.json")
+RUNS = os.path.join(STATE_DIR, "runs.md")
+CACHE = os.path.expanduser(os.environ.get("SVETOVID_DELIVERIES_CACHE") or str(sv.cache() / "lane-deliveries"))
+SIM_PATH = str(_HERE.parents[1] / "mail-rules" / "scripts" / "sieve-sim")
+FEEDS = str(_HERE.parents[1] / "feed-wiring" / "scripts" / "feeds")
+TAG = sv.get("lanes.deliveries.tag", "deliveries")
+URGENT = sv.get("rules.urgent_folder", "Urgent")
+# the script's own names for the two variables the lane's rules test (STACK.md, "The Sieve script")
+CLASS_VAR = re.escape("${%s}" % sv.get("rules.class_var", "why"))
+SVC_VAR = re.escape("${%s}" % sv.get("rules.service_var", "svc"))
+PER_SERVICE = "{svc}" in str(sv.get("folders.deliveries", "{svc}-deliveries-rss"))
+
+
+def lane_folder(svc):
+    """The shop's deliveries folder (or the one shared folder, by kind)."""
+    return sv.folder("deliveries", svc)
+
+
+def is_lane_folder(name):
+    return bool(sv._template_rx(sv.get("folders.deliveries")).match(name))
+
+# Delivery-like = a candidate for the model to judge, not a routing rule.
+# Recall over precision here; `ignore` silences recurring false hits. The
+# words, couriers and senders that make mail delivery-like are the user's
+# own (state.json, `deliv vocab`), learned from their mail: none live here.
+VOCAB_KINDS = ("subject", "final", "courier", "sender")
+# An order whose newest mail is younger than this, and not a final step, is
+# probably still running.
+IN_PROGRESS_DAYS = 21
+# A number that looks like an order or tracking number, in any language.
+ORDER_NUMBER = re.compile(r"#\s?\d{3,}|\d{5,}")
+
+
+class Vocab:
+    """The learned vocabulary, ready to match."""
+
+    def __init__(self, st, script_couriers=()):
+        v = st["vocab"]
+        self.subject = self._rx(v["subject"])
+        self.final = self._rx(v["final"])
+        self.senders = [g.lower() for g in v["sender"]]
+        self.couriers = sorted({d.lower() for d in v["courier"]} | {d.lower() for d in script_couriers})
+        self.empty = not (v["subject"] or v["sender"] or self.couriers)
+
+    @staticmethod
+    def _rx(words):
+        return re.compile("|".join(f"(?:{w})" for w in words), re.I) if words else None
+
+    def courier(self, sender):
+        dom = sender.rpartition("@")[2].lower()
+        return any(dom == d or dom.endswith("." + d) for d in self.couriers)
+
+    def delivery_like(self, r):
+        snd = r["sender"].lower()
+        return bool((self.subject and self.subject.search(r["subject"]))
+                    or any(fnmatch.fnmatchcase(snd, g) for g in self.senders)
+                    or self.courier(snd))
+
+
+# -------------------------------------------------------------------------
+def load_sim():
+    spec = importlib.util.spec_from_loader("sieve_sim", importlib.machinery.SourceFileLoader("sieve_sim", SIM_PATH))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_LIVE = None
+
+
+def live_path(sim=None):
+    """The script as deployed (origin/<branch>), fetched once per run."""
+    global _LIVE
+    if _LIVE is None:
+        _LIVE = (sim or load_sim()).live_script()
+    return _LIVE
+
+
+def live_sieve():
+    return open(live_path(), encoding="utf-8").read()
+
+
+def rows_with_live_rules(sim):
+    return sim.load(sim.Script(live_path(sim)), with_archive=False)
+
+
+def vocabulary(st):
+    """The user's vocabulary, plus the couriers their own script already names."""
+    return Vocab(st, sieve_lists(live_sieve())[2] or ())
+
+
+def die(msg):
+    print(f"deliv: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def today():
+    return dt.date.today().isoformat()
+
+
+def load_state():
+    try:
+        with open(STATE, encoding="utf-8") as fh:
+            st = json.load(fh)
+    except FileNotFoundError:
+        st = {}
+    st["tag"] = TAG
+    st.setdefault("last_scan", "")
+    st.setdefault("folders", {})
+    st.setdefault("ignore", [])
+    for kind in VOCAB_KINDS:
+        st.setdefault("vocab", {}).setdefault(kind, [])
+    st.setdefault("next_ignore", 1 + max([int(i["id"][1:]) for i in st["ignore"]] or [0]))
+    return st
+
+
+def save_state(st):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(st, fh, ensure_ascii=False, indent=1, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, STATE)
+
+
+def service_folders(sim):
+    return [f for f in sim.folders_on_disk() if sv.is_service_folder(f)]
+
+
+def norm(subject):
+    return re.sub(r"\d+", "#", subject)[:90]
+
+
+def ignored(st, r):
+    for i in st["ignore"]:
+        if i["svc"] not in ("*", r["svc"]):
+            continue
+        if i.get("subject") and not re.search(i["subject"], r["subject"], re.I):
+            continue
+        if i.get("from") and not fnmatch.fnmatchcase(r["sender"].lower(), i["from"].lower()):
+            continue
+        return i["id"]
+    return None
+
+
+def in_scope(r):
+    """Service mail that sits where a rule could still move it. Urgent IS in
+    scope: a new shop's parcel notice lands there before the shop is wired."""
+    return bool(r["svc"]) and (sv.is_service_folder(r["actual"]) or r["actual"] == URGENT)
+
+
+# -------------------------------------------------------------------------
+def cmd_sync(a):
+    for _ in range(60):
+        if subprocess.run(["pgrep", "-x", "mbsync"], capture_output=True).returncode:
+            break
+        time.sleep(5)
+    r = sv.run(sv.get("mail.sync_command"), capture_output=True)
+    print(f"deliv: synced ({'ok' if r.returncode == 0 else 'exit %d' % r.returncode})")
+    return r.returncode
+
+
+def progress(rows, vocab, subjects=True):
+    """(in_progress, why) from the newest delivery-like mail of one identity.
+    subjects=False leaves the mail's subject out of `why` (for `need`, which
+    doctor reads: counts, names and dates only)."""
+    rows = sorted(rows, key=lambda r: r["date"])
+    last = rows[-1]
+    try:
+        age = (dt.date.today() - dt.date.fromisoformat(last["date"])).days
+    except ValueError:
+        return False, "no date"
+    tail = f": {last['subject'][:60]}" if subjects else ""
+    if vocab.final and vocab.final.search(last["subject"]):
+        return False, f"last {last['date']} looks final{tail}"
+    if age <= IN_PROGRESS_DAYS:
+        return True, f"last {last['date']} ({age} d ago) is not a final step{tail}"
+    return False, f"last {last['date']} ({age} d ago)"
+
+
+def cmd_scan(a):
+    sim = load_sim()
+    st = load_state()
+    rows = rows_with_live_rules(sim)
+    vocab = vocabulary(st)
+    folders = st["folders"]
+    on_disk = set(service_folders(sim))
+    new = sorted(f for f in on_disk if f not in folders)
+    gone = sorted(f for f, v in folders.items() if f not in on_disk and v.get("status") != "wired")
+
+    by_svc = {}
+    for r in rows:
+        if not in_scope(r) or not vocab.delivery_like(r):
+            continue
+        r["ign"] = ignored(st, r)
+        if r["ign"]:
+            continue
+        by_svc.setdefault(r["svc"], []).append(r)
+
+    groups, gid = [], 0
+
+    def group(section, svc, rs):
+        nonlocal gid
+        buckets = {}
+        for r in rs:
+            buckets.setdefault((r["sender"], norm(r["subject"])), []).append(r)
+        out = []
+        for (snd, subj), b in sorted(buckets.items(), key=lambda kv: max(r["date"] for r in kv[1]), reverse=True):
+            gid += 1
+            g = {"id": f"g{gid}", "section": section, "svc": svc, "sender": snd, "subject": subj,
+                 "n": len(b), "first": min(r["date"] for r in b), "last": max(r["date"] for r in b),
+                 "folders": sorted({r["actual"] for r in b}), "pred": sorted({r["pred"] for r in b}),
+                 "bulk": sum(r["bulk"] for r in b), "paths": [r["path"] for r in b],
+                 "mids": [r["mid"] for r in b]}
+            groups.append(g)
+            out.append(g)
+        return out
+
+    def show(gs, indent="    "):
+        for g in gs:
+            where = ",".join(g["folders"])
+            pred = "" if g["pred"] == g["folders"] else f" pred={','.join(g['pred'])}"
+            lu = f" LU{g['bulk']}" if g["bulk"] else ""
+            print(f"{indent}{g['id']:>4} {g['n']:3}x {g['first']}..{g['last']} [{where}{pred}]{lu} "
+                  f"{g['sender'][:34]} | {g['subject']}")
+
+    print(f"deliv scan {today()}  (last scan: {st['last_scan'] or 'never'}; state {STATE})")
+    print(f"wired: {', '.join(sorted(f for f, v in folders.items() if v.get('status') == 'wired')) or '-'}")
+    if vocab.empty:
+        print("\n!! no vocabulary yet: nothing below can be recognised as delivery mail.\n"
+              "   Run `deliv learn`, judge what it shows, record it with `deliv vocab add`, then scan again.")
+
+    # 1. wired shops: delivery-like mail outside the feed
+    print("\n== MISSED / REFILE at wired shops (delivery-like mail not in the feed)")
+    any_ = False
+    for svc in sorted(s for s, v in folders.items() if v.get("status") == "wired"):
+        rs = [r for r in by_svc.get(svc, []) if r["pred"] != URGENT]   # Urgent by design (codes, payment)
+        refile = [r for r in rs if is_lane_folder(r["pred"])]
+        missed = [r for r in rs if not is_lane_folder(r["pred"])]
+        if not rs:
+            continue
+        any_ = True
+        print(f"  {svc}:")
+        if refile:
+            print(f"    REFILE ({len(refile)}: live rules route it, mail was not moved)")
+            show(group("refile", svc, refile), "      ")
+        if missed:
+            print(f"    MISSED ({len(missed)}: no rule takes it; widen the shop's block or ignore)")
+            show(group("missed", svc, missed), "      ")
+    if not any_:
+        print("  none")
+
+    # 2. NEW folders since the last scan
+    print(f"\n== NEW folders since the last scan ({len(new)})")
+    for f in new:
+        rs = [r for r in by_svc.get(f, []) if r["pred"] != URGENT or r["urgent"] == "parcel"]
+        if not rs:
+            print(f"  {f}: no delivery-like mail (becomes `none` at `deliv done`)")
+            continue
+        ip, why = progress(rs, vocab)
+        flag = "IN PROGRESS? defer, " if ip else ""
+        print(f"  {f}: {len(rs)} delivery-like  [{flag}{why}]")
+        show(group("new", f, rs))
+
+    # 3. known, not wired, not declined, now with delivery-like mail
+    print("\n== CANDIDATES (known folders, not wired or declined, with delivery-like mail)")
+    any_ = False
+    for svc in sorted(by_svc):
+        v = folders.get(svc)
+        if v is None or v.get("status") in ("wired", "declined"):
+            continue
+        rs = [r for r in by_svc[svc] if r["pred"] != URGENT or r["urgent"] == "parcel"]
+        if not rs:
+            continue
+        any_ = True
+        ip, why = progress(rs, vocab)
+        st_ = v.get("status")
+        flag = "IN PROGRESS? " if ip else ""
+        note = f" note: {v['note']}" if v.get("note") else ""
+        print(f"  {svc} [{st_}] {len(rs)} delivery-like  [{flag}{why}]{note}")
+        show(group("candidate", svc, rs))
+    if not any_:
+        print("  none")
+
+    deferred = [f for f, v in folders.items() if v.get("status") == "deferred" and f not in by_svc]
+    if deferred:
+        print(f"\n== DEFERRED with no delivery-like mail left in the folder: {', '.join(sorted(deferred))}")
+    if gone:
+        print(f"\n== GONE (in state, no folder on disk): {', '.join(gone)}  (deliv set <f> none, or remove by hand)")
+    declined = sorted(f for f, v in folders.items() if v.get("status") == "declined")
+    if declined:
+        print(f"\nDeclined (never asked again): {', '.join(declined)}")
+    os.makedirs(CACHE, exist_ok=True)
+    with open(os.path.join(CACHE, "last-scan.json"), "w", encoding="utf-8") as fh:
+        json.dump({"date": today(), "new": new, "groups": groups}, fh, ensure_ascii=False)
+
+
+def body_snippet(path, n=300):
+    try:
+        with open(path, "rb") as fh:
+            m = email.message_from_binary_file(fh, policy=email.policy.default)
+        part = m.get_body(preferencelist=("html", "plain"))
+        t = part.get_content() if part else ""
+        if part is not None and part.get_content_subtype() == "html":
+            t = re.sub(r"<(style|script|head)[^>]*>.*?</\1>", " ", t, flags=re.S | re.I)
+            t = re.sub(r"<!--.*?-->", " ", t, flags=re.S)
+            t = html.unescape(re.sub(r"<[^>]+>", " ", t))
+        t = re.sub(r"[​-‏͏­]+", "", t)
+        t = re.sub(r"\s+", " ", t)
+        t = sv.strip_alias_banner(t)
+        return t.strip()[:n]
+    except Exception as e:
+        return f"(unreadable: {e})"
+
+
+def cmd_show(a):
+    if re.fullmatch(r"g\d+", a.target):
+        try:
+            scan = json.load(open(os.path.join(CACHE, "last-scan.json"), encoding="utf-8"))
+        except FileNotFoundError:
+            die("no scan yet (deliv scan)")
+        g = next((g for g in scan["groups"] if g["id"] == a.target), None) or die(f"{a.target}: not in the last scan")
+        print(f"{g['id']} {g['svc']} {g['n']}x {g['sender']} | {g['subject']}  [{','.join(g['folders'])}]")
+        for p, mid in list(zip(g["paths"], g["mids"]))[: a.n]:
+            print(f"  {mid}")
+            print(f"    {body_snippet(p, 500)}")
+        return
+    sim = load_sim()
+    st = load_state()
+    vocab = vocabulary(st)
+    rows = sorted((r for r in rows_with_live_rules(sim) if r["svc"] == a.target), key=lambda r: r["date"])
+    if not rows:
+        die(f"no mail with identity {a.target!r}")
+    print(f"{a.target}: {len(rows)} mails; status {st['folders'].get(a.target, {}).get('status', 'unknown')}")
+    print("   flags: * delivery-like, i<n> ignored by rule In, LU = List-Unsubscribe")
+    for r in rows[-a.n:]:
+        ign = ignored(st, r)
+        flag = ("*" if vocab.delivery_like(r) else " ") + (ign or "").ljust(4)
+        pred = "" if r["pred"] == r["actual"] else f"->{r['pred']}"
+        lu = "LU" if r["bulk"] else "  "
+        print(f" {flag} {r['date']} {r['actual'][:22]:22}{pred[:30]:30} {lu} {r['sender'][:34]:34} | {r['subject'][:90]}")
+        if a.body:
+            print(f"        {body_snippet(r['path'], 240)}")
+
+
+def cmd_set(a):
+    st = load_state()
+    v = st["folders"].setdefault(a.svc, {})
+    v["status"] = a.status
+    v["since"] = today()
+    for k in ("words", "note", "prefix", "title"):
+        val = getattr(a, k)
+        if val is not None:
+            v[k] = val
+    if a.status == "wired":
+        v["feed"] = lane_folder(a.svc)
+    save_state(st)
+    print(f"deliv: {a.svc} -> {json.dumps(v, ensure_ascii=False)}")
+
+
+def cmd_ignore(a):
+    st = load_state()
+    if a.action == "list":
+        for i in st["ignore"]:
+            print(f"  {i['id']:>4} {i['svc']:16} {i['kind']}  subject={i.get('subject') or '*'} "
+                  f"from={i.get('from') or '*'}" + (f"  words: {i['words']}" if i.get("words") else ""))
+        return
+    if a.action == "rm":
+        before = len(st["ignore"])
+        st["ignore"] = [i for i in st["ignore"] if i["id"] not in a.ids]
+        save_state(st)
+        print(f"deliv: removed {before - len(st['ignore'])}")
+        return
+    if not (a.svc and a.kind):
+        die("ignore add needs --svc and --kind")
+    if a.svc == "*" and not (a.subject or a.sender):
+        die("ignore add --svc '*' needs --subject or --from: alone it would hide every shop's mail")
+    if a.subject:
+        re.compile(a.subject)
+    i = {"id": f"I{st['next_ignore']}", "svc": a.svc, "kind": a.kind, "added": today()}
+    if a.subject:
+        i["subject"] = a.subject
+    if a.sender:
+        i["from"] = a.sender
+    if a.words:
+        i["words"] = a.words
+    st["next_ignore"] += 1
+    st["ignore"].append(i)
+    save_state(st)
+    print(f"deliv: {i['id']} {json.dumps(i, ensure_ascii=False)}")
+
+
+def cmd_vocab(a):
+    st = load_state()
+    v = st["vocab"]
+    given = {"subject": a.subject, "final": a.final, "courier": a.courier, "sender": a.sender}
+    if a.action == "list":
+        for kind in VOCAB_KINDS:
+            print(f"{kind:8} {len(v[kind]):3}  {'  '.join(v[kind]) or '-'}")
+        named = sorted(sieve_lists(live_sieve())[2] or ())
+        if named:
+            print(f"couriers named in the deployed script (counted without being listed): {', '.join(named)}")
+        return
+    if not any(given.values()):
+        die("vocab add/rm needs --subject, --final, --courier or --sender")
+    for kind in ("subject", "final"):
+        for word in given[kind]:
+            try:
+                re.compile(word)
+            except re.error as e:
+                die(f"--{kind} {word!r} is not a regular expression: {e}")
+    for kind, words in given.items():
+        for word in words:
+            word = word.strip().lower() if kind in ("courier", "sender") else word.strip()
+            if a.action == "add" and word and word not in v[kind]:
+                v[kind].append(word)
+            elif a.action == "rm" and word in v[kind]:
+                v[kind].remove(word)
+    save_state(st)
+    print("deliv vocab: " + ", ".join(f"{kind} {len(v[kind])}" for kind in VOCAB_KINDS))
+
+
+def cmd_learn(a):
+    """Evidence for the vocabulary, from the user's own mail. This counts and
+    groups; which words mean an order or a parcel, in whatever language the
+    user's shops write, is for the model reading it to judge."""
+    sim = load_sim()
+    st = load_state()
+    vocab = vocabulary(st)
+    rows = [r for r in rows_with_live_rules(sim) if r["svc"]]
+    print(f"deliv learn {today()}   vocabulary now: "
+          + ", ".join(f"{kind} {len(st['vocab'][kind])}" for kind in VOCAB_KINDS)
+          + f"; couriers counted {len(vocab.couriers)}")
+
+    def shapes(rs, n):
+        c = collections.Counter((r["sender"].rpartition("@")[2], norm(r["subject"])) for r in rs)
+        for (dom, subj), k in c.most_common(n):
+            print(f"  {k:4}x {dom[:28]:28} | {subj}")
+        if not c:
+            print("  none")
+
+    print("\n== 1. Senders that reach several services (couriers, tracking services; also payment and review platforms)")
+    by_dom = {}
+    for r in rows:
+        dom = r["sender"].rpartition("@")[2].lower()
+        if dom and not vocab.courier(r["sender"]):
+            by_dom.setdefault(dom, []).append(r)
+    several = sorted(((len({r["svc"] for r in rs}), dom, rs) for dom, rs in by_dom.items()
+                      if len({r["svc"] for r in rs}) >= 2), key=lambda x: (-x[0], x[1]))
+    for n, dom, rs in several[: a.n]:
+        subs = [s for s, _ in collections.Counter(norm(r["subject"]) for r in rs).most_common(2)]
+        print(f"  {dom[:30]:30} {n} services, {len(rs):3} mails   e.g. " + " | ".join(x[:46] for x in subs))
+    if not several:
+        print("  none")
+
+    print("\n== 2. Mail already in a deliveries folder that the vocabulary would not recognise (words to add)")
+    shapes([r for r in rows if is_lane_folder(r["actual"]) and not vocab.delivery_like(r)], a.n)
+
+    print("\n== 3. Subjects with an order-like number that nothing recognises yet (service folders and Urgent)")
+    # not what the rules already send to Urgent as a code or an alert: those numbers are not orders
+    shapes([r for r in rows if in_scope(r) and ORDER_NUMBER.search(r["subject"])
+            and (r["pred"] != URGENT or r["urgent"] == "parcel")
+            and not vocab.delivery_like(r) and not ignored(st, r)], a.n)
+
+    print("\nRecord what you judge to be delivery wording, in the user's languages:\n"
+          "  deliv vocab add --subject '<word>' ... --final '<word that ends an order>' ...\n"
+          "                  --courier <domain> ... --sender '<glob on the address>' ...")
+
+
+def sieve_lists(src):
+    """Shop lists in the script: URGENT undo, courier block, per-shop targets."""
+    undo = re.search(r'string :is "%s" \["parcel"\],\s*string :is "%s" \[([^\]]*)\]' % (CLASS_VAR, SVC_VAR), src)
+    courier = re.search(r'string :is "%s" \[([^\]]*)\],\s*anyof \(address :domain :is "From" \[([^\]]*)\]' % SVC_VAR, src)
+    if PER_SERVICE:
+        pre, _, post = str(sv.get("folders.deliveries")).partition("{svc}")
+        targets = set(re.findall(r'fileinto :create "' + re.escape(pre) + r'([a-z0-9._-]+)' + re.escape(post) + '"', src))
+    else:   # one shared folder: the shops are the ${svc} lists of the blocks filing into it
+        targets = set()
+        for block in re.findall(r'if allof \(string :is "%s" (\[[^\]]*\]|"[^"]+")[^{]*\{\s*fileinto :create "' % SVC_VAR
+                                + re.escape(lane_folder("")) + '"', src):
+            targets |= set(re.findall(r'"([^"]+)"', block))
+    q = lambda s: set(re.findall(r'"([^"]+)"', s or ""))
+    return (q(undo.group(1)) if undo else None, q(courier.group(1)) if courier else None,
+            q(courier.group(2)) if courier else None, targets)
+
+
+def cmd_check(a):
+    st = load_state()
+    wired = {f for f, v in st["folders"].items() if v.get("status") == "wired"}
+    undo, courier, couriers, targets = sieve_lists(live_sieve())
+    ok = True
+
+    def cmp(name, got):
+        nonlocal ok
+        if got is None:
+            print(f"  FAIL {name}: not found"); ok = False; return
+        if got != wired:
+            ok = False
+            print(f"  FAIL {name}: missing {sorted(wired - got) or '-'}, extra {sorted(got - wired) or '-'}")
+        else:
+            print(f"  ok   {name}")
+
+    print(f"wired in state: {', '.join(sorted(wired)) or '(none)'}")
+    if not wired and undo is None and courier is None and not targets:
+        # A new setup: the lane's blocks are written with the first shop (SKILL.md, "The lane's rules").
+        print("  ok   no shop is wired yet, and the script holds no deliveries rules")
+    else:
+        cmp("URGENT parcel undo (deployed script)", undo)
+        cmp("ROUTE courier block shops (deployed script)", courier)
+        cmp(f"ROUTE per-shop blocks (fileinto {lane_folder('<shop>')})", targets)
+    if couriers is not None:
+        print(f"  ok   courier domains in the courier block: {', '.join(sorted(couriers))}")
+    if a.remote and wired and not sv.get("feeds", {}):
+        print("  ok   no [feeds] in the config: deliveries stay mail folders, no feed to check")
+    elif a.remote and wired:
+        out = subprocess.run(["python3", "-I", FEEDS, "list"], capture_output=True, text=True, cwd=HOME, timeout=300)
+        if out.returncode:
+            print(f"  FAIL feeds list: {out.stderr.strip()[:200]}"); ok = False
+        else:
+            text = out.stdout
+            for feed in sorted({lane_folder(s) for s in wired}):
+                m = re.search(rf"^{re.escape(feed)}: .*?(?=^\S|\Z)", text, re.M | re.S)
+                if not m:
+                    print(f"  FAIL {feed}: no bridge channel"); ok = False
+                elif f"tag {st['tag']} ->" not in m.group(0) and sv.get("feeds.hub", "rssbox") != "none":
+                    print(f"  FAIL {feed}: not in hub tag {st['tag']}"); ok = False
+                else:
+                    first = m.group(0).splitlines()[0]
+                    print(f"  ok   {first}")
+    print("deliv check: " + ("all consistent" if ok else "INCONSISTENT (fix before landing more)"))
+    return 0 if ok else 1
+
+
+def cmd_need(a):
+    """For doctor: one JSON line. Work = delivery mail the lane does not cover:
+    escaped mail at wired shops, new or known shops with finished orders.
+    Counts and names only."""
+    sim = load_sim()
+    st = load_state()
+    rows = rows_with_live_rules(sim)
+    vocab = vocabulary(st)
+    folders = st["folders"]
+    on_disk = set(service_folders(sim))
+    by_svc = {}
+    for r in rows:
+        if in_scope(r) and vocab.delivery_like(r) and not ignored(st, r):
+            by_svc.setdefault(r["svc"], []).append(r)
+    work, notes = [], []
+    if vocab.empty:
+        notes.append("no delivery vocabulary learned yet: the lane learns it from your mail in its first run")
+    for svc in sorted(s for s, v in folders.items() if v.get("status") == "wired"):
+        rs = [r for r in by_svc.get(svc, []) if r["pred"] != URGENT]
+        if rs:
+            work.append(f"{svc}: {len(rs)} delivery mail(s) outside its feed")
+    for svc in sorted(by_svc):
+        v = folders.get(svc)
+        if v is not None and v.get("status") in ("wired", "declined"):
+            continue
+        rs = [r for r in by_svc[svc] if r["pred"] != URGENT or r["urgent"] == "parcel"]
+        if not rs:
+            continue
+        ip, why = progress(rs, vocab, subjects=False)
+        kind = "new folder" if v is None else f"{v.get('status')} shop"
+        if ip:
+            notes.append(f"{svc}: order in progress ({why})")
+        else:
+            work.append(f"{kind} {svc} holds {len(rs)} order mail(s), no order in progress ({why})")
+    new_quiet = [f for f in on_disk if f not in folders and f not in by_svc]
+    if new_quiet:
+        notes.append(f"{len(new_quiet)} new folder(s) without order mail (recorded at the next run)")
+    sv.need_report("lane-deliveries", work, int(sv.get("lanes.deliveries.routine_days", 30)), notes)
+    return 0
+
+
+def cmd_done(a):
+    st = load_state()
+    try:
+        scan = json.load(open(os.path.join(CACHE, "last-scan.json"), encoding="utf-8"))
+    except FileNotFoundError:
+        die("no scan yet (deliv scan)")
+    if scan["date"] != today():
+        die(f"the last scan is from {scan['date']}; rescan first")
+    with_mail = {g["svc"] for g in scan["groups"] if g["section"] == "new"}
+    undecided = sorted(f for f in scan["new"] if f in with_mail and f not in st["folders"])
+    if undecided and not a.force:
+        die(f"new folders with delivery-like mail have no decision yet: {', '.join(undecided)} "
+            f"(deliv set <f> wired|declined|deferred|none, or --force to leave them NEW)")
+    auto = [f for f in scan["new"] if f not in with_mail and f not in st["folders"]]
+    for f in auto:
+        st["folders"][f] = {"status": "none", "since": today()}
+    st["last_scan"] = dt.datetime.now().strftime("%Y-%m-%dT%H:%M")
+    save_state(st)
+    counts = {}
+    for v in st["folders"].values():
+        counts[v.get("status")] = counts.get(v.get("status"), 0) + 1
+    line = (f"- {st['last_scan']} scan closed: {len(scan['new'])} new folders ({len(auto)} -> none); "
+            + ", ".join(f"{k} {n}" for k, n in sorted(counts.items()))
+            + (f"; {a.note}" if a.note else ""))
+    with open(RUNS, "a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+    print(line)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("sync")
+    sub.add_parser("scan")
+    p = sub.add_parser("show"); p.add_argument("target"); p.add_argument("-n", type=int, default=400)
+    p.add_argument("--body", action="store_true")
+    p = sub.add_parser("set"); p.add_argument("svc")
+    p.add_argument("status", choices=["wired", "declined", "deferred", "none"])
+    for k in ("words", "note", "prefix", "title"):
+        p.add_argument(f"--{k}")
+    p = sub.add_parser("ignore"); p.add_argument("action", choices=["add", "list", "rm"])
+    p.add_argument("ids", nargs="*"); p.add_argument("--svc"); p.add_argument("--kind")
+    p.add_argument("--subject"); p.add_argument("--from", dest="sender"); p.add_argument("--words")
+    p = sub.add_parser("vocab"); p.add_argument("action", choices=["list", "add", "rm"])
+    for kind in VOCAB_KINDS:
+        p.add_argument(f"--{kind}", action="append", default=[])
+    p = sub.add_parser("learn"); p.add_argument("-n", type=int, default=30)
+    p = sub.add_parser("check"); p.add_argument("--remote", action="store_true")
+    sub.add_parser("need")
+    p = sub.add_parser("done"); p.add_argument("--force", action="store_true"); p.add_argument("--note")
+    a = ap.parse_args()
+    return {"sync": cmd_sync, "scan": cmd_scan, "show": cmd_show, "set": cmd_set,
+            "ignore": cmd_ignore, "check": cmd_check, "done": cmd_done, "need": cmd_need,
+            "vocab": cmd_vocab, "learn": cmd_learn}[a.cmd](a) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

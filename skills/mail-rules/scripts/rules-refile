@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""rules-refile <folder> [--to F ...] [--quiet-urgent] — re-file mail already on the
+server with the DEPLOYED rules (after rules-land), under the shared lock.
+
+  1. waits for the lock rules-land uses (landing and re-filing never overlap)
+  2. --quiet-urgent: notifier.pause_command, so unread mail moved into Urgent
+     does not pop a burst of notifications; afterwards notifier.skip_command
+     (mark what is in Urgent as seen) and notifier.resume_command
+  3. sieve-refile <folder> --apply --create [--to ...] with origin/<branch>'s script
+  4. mail.quick_sync_command (bring the moves into the local copy)
+
+Always dry-run first: rules-sim <name> --refile <folder>.
+"""
+import argparse
+import fcntl
+import importlib.machinery
+import subprocess
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parents[2] / "lib"))
+import svetovid as sv  # noqa: E402
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("folder")
+    ap.add_argument("--to", action="append", default=[])
+    ap.add_argument("--quiet-urgent", action="store_true")
+    a = ap.parse_args()
+
+    lock = sv.cache() / "rules" / "land.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    fd = open(lock, "w")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("rules-refile: another agent holds the lock; waiting ...", flush=True)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    paused = False
+    try:
+        if a.quiet_urgent and sv.get("notifier.pause_command", ""):
+            sv.run(sv.get("notifier.pause_command"), check=True)
+            paused = True
+        sim = importlib.machinery.SourceFileLoader("sieve_sim", str(HERE / "sieve-sim")).load_module()
+        live = sim.live_script()
+        cmd = ["timeout", "600", "python3", "-I", str(HERE / "sieve-refile"), a.folder,
+               "--script", live, "--apply", "--create", "--show", "0"]
+        for t in a.to:
+            cmd += ["--to", t]
+        r = subprocess.run(cmd)
+        if r.returncode != 0:
+            print(f"rules-refile: sieve-refile exited {r.returncode}", file=sys.stderr)
+        if paused and sv.get("notifier.skip_command", ""):
+            sv.run(sv.get("notifier.skip_command"))
+        if sv.get("mail.quick_sync_command", ""):
+            sv.run(sv.get("mail.quick_sync_command"))
+            print("rules-refile: synced locally")
+        return r.returncode
+    finally:
+        if paused:
+            sv.run(sv.get("notifier.resume_command", "true"))
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

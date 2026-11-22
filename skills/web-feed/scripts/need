@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+"""need — web-feed's need for doctor (one JSON line). Work = a web source in the
+hub that fails to fetch, or one that normally posts at least every
+web_feed.busy_gap_h hours (default 48) and has now been
+silent for more than web_feed.silence_factor (default 5) times its usual gap
+(and at least 72 h). Slow sources (most video channels) going quiet is normal
+and only a note."""
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parents[2] / "lib"))
+import svetovid as sv  # noqa: E402
+
+if not sv.get("feeds", {}) or sv.get("feeds.hub", "rssbox") == "none":
+    sv.need_report("web-feed", [], 0, ["no hub configured: web sources live in the reader, which reports its own errors"])
+    sys.exit(0)
+try:
+    out = subprocess.run(["python3", "-I", str(HERE.parents[1] / "feed-wiring" / "scripts" / "feeds"), "web-health", "--json"],
+                         capture_output=True, text=True, timeout=400)
+    failed = (out.stderr or out.stdout).strip()[-160:] if out.returncode else ""
+except subprocess.TimeoutExpired:
+    failed = "no answer within 400 s"
+if failed:
+    sv.need_report("web-feed", [f"cannot read the hub: {failed}"], 0)
+    sys.exit(0)
+busy = float(sv.get("web_feed.busy_gap_h", 48))
+factor = float(sv.get("web_feed.silence_factor", 5))
+ignore = set(sv.get("web_feed.ignore", []))
+work, notes = [], []
+for r in json.loads(out.stdout):
+    if r["name"] in ignore:
+        continue
+    if r["fetch_ok"] is False:
+        work.append(f"{r['name']}: the hub cannot fetch it")
+    elif r["median_gap_h"] is not None and r["silent_h"] is not None and r["median_gap_h"] <= busy \
+            and r["silent_h"] > max(factor * r["median_gap_h"], 72):
+        work.append(f"{r['name']}: silent {r['silent_h']:.0f} h, usually posts every {r['median_gap_h']} h")
+    elif r["entries"] == 0:
+        notes.append(f"{r['name']}: never had an entry")
+sv.need_report("web-feed", work, 0, notes)

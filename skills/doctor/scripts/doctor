@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""doctor — examine the system and prescribe skills. Never runs a skill.
+
+    doctor            setup, health and need, then the prescriptions
+    doctor --json     the same as one JSON object (for scripts, timers)
+    doctor --setup    only the setup checks (doctor's own)
+    doctor --folders  what the server says its folders are for (sent, drafts,
+                      trash, junk, archive), to write into the config
+
+Three kinds of findings:
+  setup   doctor's own: the config exists and has what the skills need, the
+          mailbox answers, the local copy of the mail is fresh
+  health  every skill's scripts/check: is what that skill built still right?
+  need    every skill's scripts/need: is there real work for it, and the evidence
+
+Checks and needs are scripts that print counts and names, never mail
+content, so doctor is cheap enough to run any time. Each run appends one
+line to $SVETOVID_HOME/doctor/health-history.jsonl and reports what changed
+since the previous run.
+"""
+import argparse
+import concurrent.futures as cf
+import datetime as dt
+import json
+import os
+import subprocess
+import sys
+import time
+import tomllib
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+HERE = Path(__file__).resolve().parent
+SKILLS = HERE.parents[1]
+sys.path.insert(0, str(HERE.parents[2] / "lib"))
+import svetovid as sv  # noqa: E402
+
+# Prescription order: the sweep first (its decisions feed route), then the
+# lanes, then route and web-feed.
+ORDER = ["sweep", "lane-deliveries", "lane-urgent", "route", "web-feed"]
+# Who fixes a failing check, as something the user can start.
+FIXER = {
+    "mail-rules": "ask: \"fix the deployed mail rules\" (mail-rules)",
+    "feed-wiring": "ask: \"fix the failing feed\" (feed-wiring)",
+    "route": "the route skill for that service (or ask: \"re-file <folder>\")",
+    "lane-urgent": "the notifier is part of your setup: STACK.md, the parts table, \"Notifier for Urgent\"",
+    "lane-deliveries": "the lane-deliveries skill",
+}
+REQUIRED = ["mail.address", "mail.imap_host", "mail.password_command", "mail.maildir",
+            "mail.sync_command", "mail.quick_sync_command", "rules.repo", "rules.script", "rules.upload",
+            "folders.service"]
+FEED_KEYS = ["feeds.bridge_dir", "feeds.bridge_url", "feeds.mirror", "feeds.reader_url",
+             "feeds.reader_token_command"]
+
+
+def run_script(path, timeout=600):
+    t0 = time.time()
+    try:
+        p = subprocess.run([str(path)], capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr, time.time() - t0
+    except subprocess.TimeoutExpired:
+        return 124, "", f"timed out after {timeout}s", time.time() - t0
+
+
+def setup_checks():
+    out = []
+    p = sv.config_path()
+    if not p.exists():
+        return [("FAIL", f"no config at {p}: this is a first run (the doctor skill, \"First run: setup\")")], False
+    try:
+        with open(p, "rb") as fh:
+            tomllib.load(fh)
+    except Exception as e:
+        return [("FAIL", f"{p} does not parse: {e}")], False
+    missing = [k for k in REQUIRED if sv.get(k, None) in (None, "")]
+    if sv.get("feeds.bridge", None):
+        missing += [k for k in FEED_KEYS if sv.get(k, None) in (None, "")]
+    plan = sv.home() / "doctor" / "build-plan.md"
+    if missing:
+        why = ("the parts they belong to are still in the build plan" if plan.exists()
+               else "see config.example.toml")
+        out.append(("FAIL", f"config lacks: {', '.join(missing)} ({why})"))
+    else:
+        out.append(("OK", "config has every key the skills need"))
+    try:
+        m = sv.imap(timeout=30)
+        roles = sv.folder_roles(m)
+        m.logout()
+        out.append(("OK", f"the mailbox answers ({sv.get('mail.imap_host')})"))
+        # No folder name is assumed anywhere: the server says which folders are
+        # its own, and the config must set each of them aside.
+        aside = sv.not_service_folders()
+        loose = [f"{folder} ({role})" for role, folder in sorted(roles.items()) if folder not in aside]
+        if loose:
+            out.append(("WARN", f"the server's own folders {', '.join(loose)} are not set aside in the config "
+                                "(rules.not_routed, mail.trash_folder / archive_folder / junk_folder): "
+                                "the skills would take them for service folders"))
+    except BaseException as e:   # SystemExit from password() too
+        out.append(("FAIL", f"cannot log in to the mailbox: {str(e)[:120]}"))
+    module = sv.alias_module_path()
+    if module is not None and not module.exists():
+        out.append(("WARN", f"no module for the alias service {sv.get('mail.alias_service')!r}: senders behind its "
+                            f"forwards are read as the alias. Copy lib/aliases/addy_io.py to {module.name}, fill it "
+                            "in from a few real forwards, and please contribute it (a pull request)"))
+    root = sv.path("mail.maildir", None)
+    if not root or not root.is_dir():
+        where = f"at {root}" if root else "yet (mail.maildir is not set)"
+        out.append(("FAIL", f"no local copy of the mail {where} "
+                            "(STACK.md, the parts table, \"Local copy of your mail\")"))
+    else:
+        newest = 0.0
+        for sub in root.iterdir():
+            for leaf in ("new", "cur"):
+                d = sub / leaf
+                if d.is_dir():
+                    newest = max(newest, d.stat().st_mtime)
+        age_h = (time.time() - newest) / 3600
+        limit = float(sv.get("doctor.sync_max_age_h", 24))
+        if age_h > limit:
+            out.append(("WARN", f"the local copy last changed {age_h:.0f} h ago: run the sync "
+                                f"({sv.get('mail.sync_command')}) before trusting the needs"))
+        else:
+            out.append(("OK", f"the local copy is fresh (last change {age_h:.1f} h ago)"))
+    if plan.exists():
+        out.append(("WARN", f"a build plan is open ({plan}): build it in a fresh session, then run doctor again"))
+    return out, not any(level == "FAIL" for level, _ in out)
+
+
+def parse_check(skill, rc, stdout, stderr):
+    lines = []
+    for line in stdout.splitlines():
+        level, _, text = line.strip().partition(" ")
+        if level in ("OK", "WARN", "FAIL"):
+            lines.append((level, text.strip()))
+    if rc not in (0, 1) or (rc == 1 and not any(lv == "FAIL" for lv, _ in lines)):
+        lines.append(("FAIL", f"check crashed (exit {rc}): {(stderr or stdout).strip()[-200:]}"))
+    return lines
+
+
+def days_since(date):
+    try:
+        return (dt.date.today() - dt.date.fromisoformat(date[:10])).days
+    except (TypeError, ValueError):
+        return None
+
+
+def prescriptions(needs):
+    out = []
+    # ORDER places the skills it knows; a skill that ships a need script and is
+    # not listed there still gets prescribed, after them.
+    for skill in ORDER + sorted(s for s in needs if s not in ORDER):
+        n = needs.get(skill)
+        if not n:
+            continue
+        if not isinstance(n, dict) or not isinstance(n.get("work", []), list):
+            n = {"error": f"need printed something doctor cannot read: {str(n)[:120]}"}
+        if n.get("error"):
+            out.append({"skill": skill, "kind": "error", "evidence": [n["error"]]})
+            continue
+        if n.get("work"):
+            out.append({"skill": skill, "kind": "work", "evidence": n["work"], "notes": n.get("notes", [])})
+            continue
+        rd = n.get("routine_days") or 0
+        ago = days_since(n.get("last_run"))
+        if rd and (ago is None or ago >= rd):
+            when = "never run" if ago is None else f"last run {ago} days ago"
+            out.append({"skill": skill, "kind": "routine",
+                        "evidence": [f"routine check-up: nothing specific found, {when} (every {rd} days)"],
+                        "notes": n.get("notes", [])})
+        elif n.get("notes"):
+            out.append({"skill": skill, "kind": "note", "evidence": n["notes"]})
+    return out
+
+
+def history(report):
+    path = sv.skill_home("doctor") / "health-history.jsonl"
+    prev = None
+    try:
+        lines = [x for x in path.read_text(encoding="utf-8").splitlines() if x.strip()]
+        prev = json.loads(lines[-1]) if lines else None
+    except FileNotFoundError:
+        pass
+    except ValueError:      # a run cut off mid-line: start comparing again from this one
+        prev = None
+    if not isinstance(prev, dict) or "ts" not in prev:
+        prev = None
+    counts = {lv: sum(1 for s in report["health"].values() for l, _ in s if l == lv)
+              for lv in ("OK", "WARN", "FAIL")}
+    counts["setup_fail"] = sum(1 for l, _ in report["setup"] if l == "FAIL")
+    line = {"ts": dt.datetime.now().isoformat(timespec="seconds"), **counts,
+            "prescribed": [p["skill"] for p in report["prescriptions"] if p["kind"] in ("work", "routine", "error")],
+            "failing": sorted({f"{s}: {t[:60]}" for s, ls in report["health"].items() for l, t in ls if l == "FAIL"})}
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(line, ensure_ascii=False) + "\n")
+    if not prev:
+        return ["first run: no history yet"]
+    changes = []
+    for key, word in (("FAIL", "failing checks"), ("WARN", "warnings")):
+        if prev.get(key, 0) != line[key]:
+            changes.append(f"{word}: {prev.get(key, 0)} -> {line[key]}")
+    fixed = sorted(set(prev.get("failing", [])) - set(line["failing"]))
+    new = sorted(set(line["failing"]) - set(prev.get("failing", [])))
+    changes += [f"fixed since last time: {f}" for f in fixed] + [f"new since last time: {f}" for f in new]
+    gone = sorted(set(prev.get("prescribed", [])) - set(line["prescribed"]))
+    if gone:
+        changes.append(f"no longer prescribed: {', '.join(gone)}")
+    return changes or [f"nothing changed since {prev['ts'][:16].replace('T', ' ')}"]
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--setup", action="store_true", help="only doctor's own setup checks")
+    ap.add_argument("--folders", action="store_true", help="the server's own folders, by role")
+    a = ap.parse_args()
+
+    if a.folders:
+        m = sv.imap(timeout=30)
+        roles = sv.folder_roles(m)
+        m.logout()
+        if not roles:
+            print("The server marks no folder with a role. Ask the user which folders hold sent mail, "
+                  "drafts, trash, junk and the archive.")
+            return 0
+        print("What the server says its folders are for:")
+        for role in ("sent", "drafts", "trash", "junk", "archive"):
+            print(f"  {role:8} {roles.get(role, '-')}")
+        print("\nIn config.toml: [rules] not_routed = the sent and drafts folders;\n"
+              "[mail] trash_folder, junk_folder, archive_folder = the other three.")
+        return 0
+
+    setup, ok = setup_checks()
+    report = {"setup": setup, "health": {}, "needs": {}, "prescriptions": [], "changes": []}
+    if ok and not a.setup:
+        jobs = {}
+        with cf.ThreadPoolExecutor(max_workers=6) as ex:
+            for d in sorted(SKILLS.iterdir()):
+                for kind in ("check", "need"):
+                    script = d / "scripts" / kind
+                    if script.is_file() and os.access(script, os.X_OK):
+                        jobs[ex.submit(run_script, script)] = (d.name, kind)
+                    elif script.is_file():      # an install that lost the executable bit
+                        report["health"].setdefault(d.name, []).append(
+                            ("FAIL", f"{script} is not executable, so it was not run (chmod +x)"))
+            for fut in cf.as_completed(jobs):
+                skill, kind = jobs[fut]
+                rc, stdout, stderr, secs = fut.result()
+                if kind == "check":
+                    report["health"].setdefault(skill, []).extend(parse_check(skill, rc, stdout, stderr))
+                else:
+                    try:
+                        report["needs"][skill] = json.loads(stdout.strip().splitlines()[-1])
+                    except Exception:
+                        report["needs"][skill] = {"error": f"need crashed (exit {rc}): "
+                                                           f"{(stderr or stdout).strip()[-200:]}"}
+        report["prescriptions"] = prescriptions(report["needs"])
+        report["changes"] = history(report)
+
+    if a.json:
+        print(json.dumps(report, ensure_ascii=False, indent=1, default=str))
+        return 0 if ok else 1
+
+    print(f"doctor {dt.datetime.now():%Y-%m-%d %H:%M}\n")
+    print("Setup")
+    for level, text in setup:
+        print(f"  {level:<4} {text}")
+    if not ok or a.setup:
+        return 0 if ok else 1
+    print("\nHealth")
+    for skill in sorted(report["health"]):
+        for level, text in report["health"][skill]:
+            fix = f"   -> {FIXER[skill]}" if level == "FAIL" and skill in FIXER else ""
+            print(f"  {level:<4} {skill:<16} {text}{fix}")
+    print("\nPrescriptions")
+    shown = [p for p in report["prescriptions"] if p["kind"] != "note"]
+    if not shown:
+        print("  none: nothing needs a skill right now")
+    for i, p in enumerate(shown, 1):
+        print(f"  {i}. {p['skill']}" + ("  (routine)" if p["kind"] == "routine" else ""))
+        for ev in p["evidence"]:
+            print(f"       {ev}")
+        for note in p.get("notes", []):
+            print(f"       note: {note}")
+        print(f"       -> {sv.get('doctor.command_prefix', '/')}{p['skill']}")
+    notes = [p for p in report["prescriptions"] if p["kind"] == "note"]
+    if notes:
+        print("\nNotes (not work yet)")
+        for p in notes:
+            for ev in p["evidence"]:
+                print(f"  {p['skill']}: {ev}")
+    print("\nSince last time")
+    for c in report["changes"]:
+        print(f"  {c}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

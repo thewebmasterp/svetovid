@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""sieve-probe — send test mail through your provider and check where it lands.
+
+Uploading a script proves nothing about delivery: whether it runs at all can
+depend on provider settings. This sends one probe per case in
+[[rules.probe.case]], polls IMAP until each has landed (or a timeout), and
+prints case -> folder(s). A failing case prints its `hint`.
+
+    sieve-probe                  send, then report
+    sieve-probe --via submit     send through authenticated submission instead
+    sieve-probe --report TOKEN   re-check an earlier run without sending
+    sieve-probe --clean          delete every probe message (and the probe folder
+                                 when it is left empty)
+
+Each case: to (recipient), expect (list of folders it must be in, and only
+those), subject (extra words for the Subject, e.g. an Urgent key), name, hint.
+
+--via mx (default) sends to the provider's MX on port 25, unauthenticated,
+the path real outside mail takes. Use submit only when port 25 is blocked or
+probes keep landing in Junk (spam scoring, not routing): authenticated mail
+may be delivered internally and skip provider-side steps.
+
+Settings: [rules.probe] via, mx_host, mx_helo, mx_from, tag, timeout;
+mail.smtp_host, mail.smtp_port, mail.address, mail.imap_host,
+mail.password_command. Exit 3: no cases configured.
+"""
+import argparse
+import re
+import smtplib
+import sys
+import time
+import uuid
+from email.message import EmailMessage
+from email.utils import formatdate, make_msgid
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "lib"))
+import svetovid as sv  # noqa: E402
+
+TAG = sv.get("rules.probe.tag", "sieveprobe")
+CASES = sv.get("rules.probe.case", [])
+
+
+# What a probe's Subject line looks like (see build): the tag, the run's token,
+# the case number. --clean deletes on this, so it must not fit anything else,
+# whatever the tag is set to.
+PROBE_SUBJECT = re.compile(r"subject: " + re.escape(TAG) + r" [0-9a-f]{8} #\d+ ", re.I)
+
+
+def q(name):
+    return '"' + name.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def folders(m):
+    typ, data = m.list()
+    out = []
+    for raw in data:
+        line = raw.decode("utf-8", "replace").rstrip()
+        if "\\Noselect" in line.split(")")[0]:
+            continue
+        out.append(line.rsplit('"', 2)[-2] if line.endswith('"') else line.rsplit(" ", 1)[-1])
+    return out
+
+
+def probe_uids(m, needle):
+    """UIDs in the selected folder whose Subject really starts with the tag.
+
+    Some servers' SEARCH SUBJECT matches per-token substrings, so SEARCH only
+    narrows the set and the subject is re-checked here. Returns {uid: subject}.
+    """
+    typ, data = m.uid("SEARCH", None, "SUBJECT", q(needle))
+    uids = data[0].split() if typ == "OK" and data and data[0] else []
+    out = {}
+    if not uids:
+        return out
+    typ, resp = m.uid("FETCH", b",".join(uids), "(UID BODY.PEEK[HEADER.FIELDS (SUBJECT)])")
+    for item in resp or []:
+        if not isinstance(item, tuple):
+            continue
+        head = item[0].decode("utf-8", "replace")
+        if "UID " not in head:
+            continue
+        uid = head.split("UID ")[1].split()[0].strip(")")
+        subj = " ".join(item[1].decode("utf-8", "replace").split())
+        if PROBE_SUBJECT.match(subj):
+            out[uid] = subj
+    return out
+
+
+def probes_in(m, folder, token):
+    typ, _ = m.select(q(folder), readonly=True)
+    if typ != "OK":
+        return set()
+    found = set()
+    for subj in probe_uids(m, token).values():
+        for i in range(len(CASES)):
+            if f"{TAG} {token} #{i} " in subj + " ":
+                found.add(i)
+    return found
+
+
+def build(token, i, case, sender):
+    msg = EmailMessage()
+    extra = f" {case['subject']}" if case.get("subject") else ""
+    msg["From"] = sender
+    msg["To"] = case["to"]
+    msg["Subject"] = f"{TAG} {token} #{i} -> {case['to']}{extra}"
+    # Without Date and Message-ID the spam score roughly doubles.
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain=sender.split("@", 1)[1])
+    msg.set_content(f"Routing probe {token} for {case['to']}.\n\n"
+                    "Sent by sieve-probe (svetovid) to check which folder this address is filed in.\n"
+                    "Safe to delete; `sieve-probe --clean` removes all of them.\n")
+    return msg
+
+
+def send(token, via):
+    for i, case in enumerate(CASES):
+        if via == "mx":
+            helo = sv.get("rules.probe.mx_helo")
+            sender = sv.get("rules.probe.mx_from")
+            # One connection per probe: several unauthenticated messages in
+            # one session score worse.
+            with smtplib.SMTP(sv.get("rules.probe.mx_host"), 25, local_hostname=helo, timeout=40) as s:
+                s.starttls()
+                s.ehlo(helo)
+                s.send_message(build(token, i, case, sender), from_addr=sender, to_addrs=[case["to"]])
+            time.sleep(2)
+        else:
+            user = sv.get("mail.address")
+            with smtplib.SMTP_SSL(sv.get("mail.smtp_host"), int(sv.get("mail.smtp_port", 465)), timeout=30,
+                                  context=sv.tls()) as s:
+                s.login(user, sv.password())
+                s.send_message(build(token, i, case, user), from_addr=user, to_addrs=[case["to"]])
+        print(f"  sent #{i} -> {case['to']}")
+
+
+def report(m, token, timeout):
+    deadline = time.time() + timeout
+    found = {i: set() for i in range(len(CASES))}
+    while True:
+        for folder in folders(m):
+            for i in probes_in(m, folder, token):
+                found[i].add(folder)
+        if all(found[i] >= set(c["expect"]) for i, c in enumerate(CASES)) or time.time() >= deadline:
+            break
+        time.sleep(5)
+    ok, hints = True, []
+    print()
+    for i, case in enumerate(CASES):
+        exp, got = set(case["expect"]), found[i]
+        good = got == exp
+        ok &= good
+        what = case.get("name") or case["to"]
+        extra = f'  "..{case["subject"]}"' if case.get("subject") else ""
+        print(f"  {'OK ' if good else '!! '}{what:<36}{case['to'][:30]:<31}{extra[:28]:<28}"
+              f" expected {sorted(exp)}  got {sorted(got) or '(nothing yet)'}")
+        if not good and case.get("hint"):
+            hints.append(f"  #{i} {what}: {case['hint']}")
+    print()
+    if ok:
+        print("all probes landed as expected")
+        return 0
+    junk = sv.get("mail.junk_folder", "")
+    if junk and any(junk in fs for fs in found.values()):
+        print(f"Probe(s) in {junk}: spam-scored in transit, not a routing result. Rerun, or --via submit.")
+    for line in hints:
+        print(line)
+    print(f"\nMISMATCH or still in transit. Re-check with: sieve-probe --report {token}")
+    return 1
+
+
+def clean(m):
+    typ, caps = m.capability()
+    uidplus = typ == "OK" and b"UIDPLUS" in caps[0].upper()
+    n = 0
+    for folder in folders(m):
+        typ, _ = m.select(q(folder))
+        if typ != "OK":
+            continue
+        uids = sorted(probe_uids(m, TAG), key=int)
+        if uids:
+            batch = ",".join(uids)
+            m.uid("STORE", batch, "+FLAGS", "(\\Deleted)")
+            # UID EXPUNGE removes only the probes; a bare EXPUNGE would also
+            # purge anything else in the folder already flagged \Deleted.
+            if uidplus:
+                m.uid("EXPUNGE", batch)
+            else:
+                m.expunge()
+            n += len(uids)
+            print(f"  removed {len(uids):>3} from {folder}")
+    # Leave by selecting another folder read-only: CLOSE would expunge, and a
+    # selected mailbox cannot be deleted.
+    m.select("INBOX", readonly=True)
+    if TAG in folders(m):
+        typ, st = m.status(q(TAG), "(MESSAGES)")
+        left = int(st[0].decode().rsplit("MESSAGES ", 1)[1].rstrip(")")) if typ == "OK" else -1
+        if left == 0:
+            m.unsubscribe(q(TAG))
+            typ, _ = m.delete(q(TAG))
+            print(f"  folder {TAG}: DELETE {typ}")
+        else:
+            print(f"  folder {TAG}: kept, {left} non-probe message(s) in it")
+    print(f"removed {n} probe messages")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--via", choices=("mx", "submit"), default=sv.get("rules.probe.via", "mx"))
+    ap.add_argument("--clean", action="store_true")
+    ap.add_argument("--report", metavar="TOKEN")
+    ap.add_argument("--timeout", type=int, default=int(sv.get("rules.probe.timeout", 150)))
+    args = ap.parse_args()
+    if not CASES and not args.clean:
+        print("sieve-probe: no [[rules.probe.case]] in config.toml: nothing to send", file=sys.stderr)
+        return 3    # rules-land reads this as "no probes configured", not as a failed probe
+
+    m = sv.imap()
+    try:
+        if args.clean:
+            clean(m)
+            return 0
+        if args.report:
+            return report(m, args.report, 0)
+        token = uuid.uuid4().hex[:8]
+        print(f"probe token {token}  (via {args.via})")
+        send(token, args.via)
+        print(f"\npolling IMAP for up to {args.timeout}s ...")
+        return report(m, token, args.timeout)
+    finally:
+        m.logout()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

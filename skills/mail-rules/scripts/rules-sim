@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# rules-sim <name> [sieve-sim args]        replay the archive with the workspace's script
+# rules-sim <name> --diff                  everything your change files differently: the workspace's
+#                                       script against the origin/<branch> it was branched from
+#                                       (so another agent's landing never shows up as yours)
+# rules-sim <name> --refile <folder> [--to F] [--show N]
+#                                       server dry run (read-only) with the workspace's script
+# Read-only everywhere; safe in parallel.
+set -euo pipefail
+name="${1:?usage: rules-sim <name> [args]}"; shift
+[[ "$name" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || { echo "rules-sim: '$name' is not a workspace name (lowercase letters, digits, . _ -)" >&2; exit 1; }
+HERE="$(dirname "$(readlink -f "$0")")"; ROOT="$(cd "$HERE/../../.." && pwd)"; SV=(python3 -I "$ROOT/lib/svetovid.py")
+WS="$("${SV[@]}" cache)/rules/$name"; SCRIPT="$("${SV[@]}" get rules.script)"
+[[ -d "$WS/sieve" ]] || { echo "rules-sim: no workspace '$name' (rules-start $name)" >&2; exit 1; }
+if [[ "${1:-}" == "--refile" ]]; then
+    shift
+    for a in "$@"; do [[ "$a" == "--apply" ]] && { echo "rules-sim: --refile is a dry run; use rules-refile after rules-land" >&2; exit 1; }; done
+    exec timeout 300 python3 -I "$HERE/sieve-refile" --script "$WS/sieve/$SCRIPT" "$@"
+fi
+if [[ "${1:-}" == "--diff" && $# -eq 1 ]]; then
+    BRANCH="$("${SV[@]}" get rules.branch main)"
+    rev="$(git -C "$WS/sieve" merge-base HEAD "origin/$BRANCH")"
+    base="$WS/base.sieve"; git -C "$WS/sieve" show "$rev:$SCRIPT" > "$base"
+    set -- --diff "$base"
+fi
+SIEVE_MAIN="$WS/sieve/$SCRIPT" exec python3 -I "$HERE/sieve-sim" "$@"

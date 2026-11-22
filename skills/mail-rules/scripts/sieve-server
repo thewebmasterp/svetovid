@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""sieve-server — talk to your provider's ManageSieve service (RFC 5804).
+
+    sieve-server list                     scripts on the server (* = active)
+    sieve-server get [NAME] [--out FILE]  download a script (default: rules.script_name)
+    sieve-server check FILE               ask the server to validate FILE (uploads nothing)
+    sieve-server put FILE [NAME]          upload FILE as NAME (does not activate)
+    sieve-server activate [NAME]          make NAME the active script
+    sieve-server same FILE [NAME]         exit 0 if the server's NAME equals FILE and is
+                                          the active script
+
+Settings (config.toml): mail.address (login), mail.password_command,
+rules.managesieve_host (default: mail.imap_host), rules.managesieve_port
+(default 4190), rules.script_name (default "main"). The connection always
+upgrades to TLS (STARTTLS) before logging in. The password is read at run
+time and never stored.
+"""
+import base64
+import re
+import socket
+import ssl
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "lib"))
+import svetovid as sv  # noqa: E402
+
+
+class ManageSieve:
+    def __init__(self, host, port):
+        self.sock = socket.create_connection((host, port), timeout=30)
+        self.host = host
+        self.buf = b""
+        self.read_response()                     # greeting + capabilities
+        self.cmd(b"STARTTLS")
+        ctx = ssl.create_default_context()
+        self.sock = ctx.wrap_socket(self.sock, server_hostname=host)
+        self.buf = b""
+        self.read_response()                     # capabilities again, over TLS
+
+    def _line(self):
+        while b"\r\n" not in self.buf:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise SystemExit("sieve-server: connection closed")
+            self.buf += chunk
+        line, self.buf = self.buf.split(b"\r\n", 1)
+        return line
+
+    def _exact(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise SystemExit("sieve-server: connection closed")
+            self.buf += chunk
+        data, self.buf = self.buf[:n], self.buf[n:]
+        return data
+
+    def read_response(self):
+        """Read until OK/NO/BYE. Returns (status, text, data lines/literals)."""
+        data = []
+        while True:
+            line = self._line()
+            m = re.match(rb"^(OK|NO|BYE)\b ?(.*)$", line)
+            if m:
+                text = m.group(2)
+                lit = re.search(rb"\{(\d+)\}$", text)
+                if lit:
+                    text = self._exact(int(lit.group(1)))
+                    self._line()
+                return m.group(1).decode(), text.decode("utf-8", "replace").strip(), data
+            lit = re.search(rb"\{(\d+)\}$", line)
+            if lit:
+                data.append(self._exact(int(lit.group(1))))
+                continue
+            data.append(line)
+
+    def cmd(self, line, literal=None):
+        out = line
+        if literal is not None:
+            out += b" {%d+}\r\n" % len(literal) + literal
+        self.sock.sendall(out + b"\r\n")
+        status, text, data = self.read_response()
+        if status != "OK":
+            raise SystemExit(f"sieve-server: {line.split(b' ')[0].decode()} failed: {status} {text}")
+        return text, data
+
+    def login(self, user, password):
+        token = base64.b64encode(b"\0" + user.encode() + b"\0" + password.encode())
+        self.cmd(b'AUTHENTICATE "PLAIN" "' + token + b'"')
+
+    def logout(self):
+        try:
+            self.sock.sendall(b"LOGOUT\r\n")
+            self.sock.close()
+        except Exception:
+            pass
+
+
+def q(s):
+    return b'"' + s.replace("\\", "\\\\").replace('"', '\\"').encode() + b'"'
+
+
+def connect():
+    host = sv.get("rules.managesieve_host", None) or sv.get("mail.imap_host")
+    port = int(sv.get("rules.managesieve_port", 4190))
+    ms = ManageSieve(host, port)
+    ms.login(sv.get("mail.address"), sv.password())
+    return ms
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    op, rest = argv[0], argv[1:]
+    out = None
+    if "--out" in rest:
+        i = rest.index("--out")
+        out, rest = rest[i + 1], rest[:i] + rest[i + 2:]
+    default_name = sv.get("rules.script_name", "main")
+    ms = connect()
+    try:
+        if op == "list":
+            _, data = ms.cmd(b"LISTSCRIPTS")
+            for line in data:
+                s = line.decode("utf-8", "replace")
+                m = re.match(r'^"(.*)"( ACTIVE)?$', s)
+                print(("* " if m and m.group(2) else "  ") + (m.group(1) if m else s))
+        elif op in ("get", "same"):
+            local = rest[0] if op == "same" else None
+            name = (rest[1] if op == "same" and len(rest) > 1 else
+                    rest[0] if op == "get" and rest else default_name)
+            _, data = ms.cmd(b"GETSCRIPT " + q(name))
+            script = data[0] if data else b""
+            if op == "same":
+                mine = Path(local).read_bytes()
+                same = script.replace(b"\r\n", b"\n") == mine.replace(b"\r\n", b"\n")
+                print(f"sieve-server: server '{name}' {'==' if same else '!='} {local}")
+                # Equal text is not enough: another script may be the active one
+                # (activated in the provider's web editor, say).
+                _, listing = ms.cmd(b"LISTSCRIPTS")
+                state = {}
+                for line in listing:
+                    m = re.match(r'^"(.*)"( ACTIVE)?$', line.decode("utf-8", "replace"), re.I)
+                    if m:
+                        state[m.group(1)] = bool(m.group(2))
+                if same and state.get(name) is False:
+                    active = [n for n, on in state.items() if on]
+                    print(f"sieve-server: but '{name}' is NOT the active script "
+                          f"(active: {', '.join(active) or 'none'}); run: sieve-server activate")
+                    return 1
+                return 0 if same else 1
+            if out:
+                Path(out).write_bytes(script)
+            else:
+                sys.stdout.write(script.decode("utf-8", "replace"))
+        elif op == "check":
+            text, _ = ms.cmd(b"CHECKSCRIPT", Path(rest[0]).read_bytes())
+            print(f"sieve-server: the server accepts {rest[0]}" + (f" ({text})" if text else ""))
+        elif op == "put":
+            name = rest[1] if len(rest) > 1 else default_name
+            ms.cmd(b"PUTSCRIPT " + q(name), Path(rest[0]).read_bytes())
+            print(f"sieve-server: uploaded {rest[0]} as '{name}' (not activated)")
+        elif op == "activate":
+            name = rest[0] if rest else default_name
+            ms.cmd(b"SETACTIVE " + q(name))
+            print(f"sieve-server: '{name}' is active")
+        else:
+            print(__doc__, file=sys.stderr)
+            return 2
+    finally:
+        ms.logout()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

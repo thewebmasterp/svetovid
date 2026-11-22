@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""triage <folder> [--first-lines] [--since YYYY-MM-DD] — break down one mail
+folder from the local copy of your mail (mail.maildir). Read-only.
+
+Prints:
+  * senders (the real one behind an alias service's forwards), with count, how many carry
+    List-Unsubscribe (LU = marketing marker at most services), date range
+  * discriminating headers: X-*/List-* headers that are not transport noise,
+    with their values when there are few: a platform's type header beats
+    Subject matching every time (record it for the sweep: ms type-headers add)
+  * subject groups per sender (digit runs masked), newest first
+  * --first-lines: the first body line of each group (GitHub-style mail says
+    the event there: "X approved", "pushed N commits")
+"""
+import argparse, collections, email, email.parser, email.policy, html, os, re, sys
+from email.utils import parseaddr, parsedate_to_datetime
+
+from pathlib import Path
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "lib"))
+import svetovid as sv  # noqa: E402
+
+ROOT = str(sv.path("mail.maildir"))
+NOISE = re.compile(r"^(x-(migadu|mizu|spam|tuid|envelope-to|received|ms-|google|gm-|mailer-|originating|"
+                   r"virus|report-abuse|complaints|feedback|"
+                   r"ses-|sg-eid|entity|mc-|csa|auto-response|priority|msmail|mime|source|abuse)|"
+                   r"list-unsubscribe-post)", re.I)
+# plus what the user's alias service adds to every forward (lib/aliases/)
+ALIAS_NOISE = re.compile(sv.alias().NOISE_HEADERS, re.I) if sv.alias().NOISE_HEADERS else None
+P = email.parser.BytesParser(policy=email.policy.default)
+
+
+def first_line(msg):
+    try:
+        part = msg.get_body(preferencelist=("plain", "html"))
+        text = part.get_content() if part else ""
+    except Exception:
+        return ""
+    if part is not None and part.get_content_subtype() == "html":
+        text = re.sub(r"<(style|script)[^>]*>.*?</\1>", "", text, flags=re.S | re.I)
+        text = html.unescape(re.sub(r"<[^>]+>", "\n", text))
+    for line in text.splitlines():
+        line = line.strip()
+        if len(line) > 3 and not line.startswith(("http", ">", "[", "—")):
+            return re.sub(r"\d+", "#", line)[:90]
+    return ""
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("folder")
+    ap.add_argument("--first-lines", action="store_true")
+    ap.add_argument("--since", default="")
+    a = ap.parse_args()
+    base = os.path.join(ROOT, a.folder)
+    if not os.path.isdir(os.path.join(base, "cur")):
+        sys.exit(f"no folder {base}")
+    rows, hdr = [], collections.defaultdict(collections.Counter)
+    for sub in ("cur", "new"):
+        for n in os.listdir(os.path.join(base, sub)):
+            with open(os.path.join(base, sub, n), "rb") as fh:
+                m = P.parse(fh) if a.first_lines else email.parser.BytesHeaderParser(policy=email.policy.default).parse(fh)
+            try:
+                d = parsedate_to_datetime(str(m["Date"])).date().isoformat()
+            except Exception:
+                d = "?"
+            if d < a.since:
+                continue
+            sender = parseaddr(sv.real_sender(m))[1].lower()
+            subj = re.sub(r"\d{2,}", "#", " ".join(str(m.get("Subject", "")).split()))[:85]
+            rows.append(dict(date=d, sender=sender, lu=bool(m["List-Unsubscribe"]), subj=subj,
+                             first=first_line(m) if a.first_lines else ""))
+            for k in set(m.keys()):
+                kl = k.lower()
+                if (kl.startswith(("x-", "list-")) or kl == "precedence") and not NOISE.match(kl) \
+                        and not (ALIAS_NOISE and ALIAS_NOISE.match(kl)):
+                    hdr[k][" ".join(str(m.get(k)).split())[:60]] += 1
+    n = len(rows)
+    print(f"{a.folder}: {n} messages" + (f" since {a.since}" if a.since else ""))
+    if not n:
+        return
+    print("\nSENDERS  (count, with List-Unsubscribe, first..last)")
+    by = collections.defaultdict(list)
+    for r in rows:
+        by[r["sender"]].append(r)
+    for s, rs in sorted(by.items(), key=lambda x: -len(x[1])):
+        ds = sorted(r["date"] for r in rs)
+        print(f"  {len(rs):5} LU {sum(r['lu'] for r in rs):4}  {ds[0]}..{ds[-1]}  {s}")
+    print("\nHEADERS that may discriminate  (present in N messages; values if few)")
+    for k, c in sorted(hdr.items(), key=lambda x: (-sum(x[1].values()), x[0].lower())):
+        tot = sum(c.values())
+        if len(c) <= 25 and tot >= 2:
+            vals = ", ".join(f"{v!r}={x}" for v, x in c.most_common(8))
+            print(f"  {k} ({tot}, {len(c)} values): {vals}")
+        else:
+            print(f"  {k} ({tot}, {len(c)} distinct values)")
+    print("\nSUBJECT GROUPS per sender  (count, LU, latest)")
+    for s, rs in sorted(by.items(), key=lambda x: -len(x[1])):
+        print(f"  == {s}")
+        g = collections.defaultdict(list)
+        for r in rs:
+            g[(r["subj"], r["first"])].append(r)
+        for (subj, fl), grp in sorted(g.items(), key=lambda x: (-len(x[1]), x[0])):
+            last = max(r["date"] for r in grp)
+            print(f"    {len(grp):4} {'LU' if any(r['lu'] for r in grp) else '  '} {last}  {subj}")
+            if fl:
+                print(f"              first line: {fl}")
+
+
+if __name__ == "__main__":
+    main()

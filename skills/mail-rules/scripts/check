@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# check — mail-rules' health for doctor. One line per finding (OK/WARN/FAIL),
+# exit 1 on FAIL:
+#   the server runs exactly what is on origin/<branch> of the rules repo (and
+#   it is the active script), sieve-sim can execute that script, the main
+#   checkout is clean and current, probe cases exist.
+# The one thing it changes: a clean main checkout that is only behind is
+# fast-forwarded, because the replay reads it.
+HERE="$(dirname "$(readlink -f "$0")")"; ROOT="$(cd "$HERE/../../.." && pwd)"; SV=(python3 -I "$ROOT/lib/svetovid.py")
+REPO="$("${SV[@]}" path rules.repo)"; BRANCH="$("${SV[@]}" get rules.branch main)"
+SCRIPT="$("${SV[@]}" get rules.script)"; VERIFY="$("${SV[@]}" get rules.verify managesieve)"
+fail=0
+# The path is the last line; a failed fetch prints a warning before it.
+out="$(python3 -I -B -c "import importlib.machinery as m, sys; print(m.SourceFileLoader('s', sys.argv[1]).load_module().live_script())" "$HERE/sieve-sim" 2>&1)" \
+    || { echo "FAIL the deployed script cannot be read: ${out##*$'\n'}"; exit 1; }
+live="${out##*$'\n'}"
+[[ "$out" != *"could not fetch origin"* ]] || echo "WARN could not fetch the rules repo's origin: checked against origin/$BRANCH as last fetched"
+if out="$(SIEVE_MAIN="$live" python3 -I "$HERE/sieve-sim" --check 2>&1)"; then
+    echo "OK   sieve-sim executes the deployed script"
+else
+    echo "FAIL sieve-sim cannot execute origin/$BRANCH: ${out##*$'\n'}"; fail=1
+fi
+if [[ "$VERIFY" != "none" ]]; then
+    if python3 -I "$HERE/sieve-server" same "$live" >/dev/null 2>&1; then
+        echo "OK   the server runs origin/$BRANCH"
+    else
+        echo "FAIL the server does not run origin/$BRANCH: its script differs, is not the active one, or the server is unreachable"; fail=1
+    fi
+fi
+if [[ -n "$(git -C "$REPO" status --porcelain)" ]]; then
+    echo "WARN $REPO has uncommitted edits"
+elif [[ "$(git -C "$REPO" rev-parse HEAD)" != "$(git -C "$REPO" rev-parse "origin/$BRANCH")" ]]; then
+    # only the branch that is live: never move another branch the user has checked out
+    if [[ "$(git -C "$REPO" branch --show-current)" == "$BRANCH" ]] \
+            && git -C "$REPO" merge -q --ff-only "origin/$BRANCH" 2>/dev/null; then
+        echo "OK   main checkout fast-forwarded to origin/$BRANCH"
+    else
+        echo "WARN $REPO is not at origin/$BRANCH and cannot fast-forward"
+    fi
+fi
+[[ -n "$("${SV[@]}" get rules.probe.case "")" ]] \
+    || echo "WARN no [[rules.probe.case]] in the config: a landing is not proven with real mail"
+open="$(ls "$("${SV[@]}" cache)/rules" 2>/dev/null | grep -v '^land.lock$' | tr '\n' ' ')"
+[[ -z "$open" ]] || echo "WARN open rules workspaces: $open(finish with rules-land, or rules-done)"
+exit $fail

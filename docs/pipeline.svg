@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 362" role="img" aria-label="How it fits together: Sieve sorts your mail four ways. Two reach you directly: Urgent (notifies you) and INBOX (people writing to you, read when you choose). The other two stay among your information sources: unrouted mail, cleared by the weekly sweep, and -rss folders, which mailfeed publishes as feeds. Those feeds and websites, profiles and feeds are what RSSBox filters, summarizes and groups; Miniflux is your reader on every device">
+  <style>
+    .bg { fill: #ffffff; }
+    .n { fill: #ffffff; stroke: #c9ced8; stroke-width: 1.5; }
+    .entry { fill: #e2f0f1; stroke: #1d6b73; stroke-width: 1.5; }
+    .prim { fill: #f6ecd9; stroke: #9a6614; stroke-width: 1.5; }
+    .src { fill: none; stroke: #c9ced8; stroke-width: 1.5; stroke-dasharray: 5 4; }
+    .t { fill: #1a2030; font: 12px ui-monospace, "SFMono-Regular", Menlo, monospace; }
+    .tb { fill: #1a2030; font: 600 13px ui-monospace, "SFMono-Regular", Menlo, monospace; }
+    .ts { fill: #5a6376; font: 11px system-ui, -apple-system, "Segoe UI", sans-serif; }
+    .th { fill: #5a6376; font: 10.5px ui-monospace, Menlo, monospace; letter-spacing: 0.08em; }
+    .flow { stroke: #5a6376; stroke-width: 1.3; fill: none; }
+    .ah { fill: #5a6376; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #10141b; }
+      .n { fill: #181e28; stroke: #2c3442; }
+      .entry { fill: #17323a; stroke: #5ab8c1; }
+      .prim { fill: #352a17; stroke: #dcab55; }
+      .src { stroke: #2c3442; }
+      .t, .tb { fill: #e4e7ed; }
+      .ts, .th { fill: #9aa3b3; }
+      .flow { stroke: #9aa3b3; }
+      .ah { fill: #9aa3b3; }
+    }
+  </style>
+  <defs><marker id="p" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="ah" d="M0 0L10 5L0 10z"/></marker></defs>
+  <rect class="bg" x="0" y="0" width="680" height="362" rx="8"/>
+
+  <!-- where mail reaches you directly: outside the sources -->
+  <rect class="entry" x="74" y="20" width="172" height="40" rx="6"/>
+  <text class="t" x="160" y="37" text-anchor="middle">Urgent</text>
+  <text class="ts" x="160" y="52" text-anchor="middle">notifies you</text>
+
+  <rect class="entry" x="262" y="8" width="190" height="52" rx="6"/>
+  <text class="t" x="357" y="25" text-anchor="middle">INBOX</text>
+  <text class="ts" x="357" y="40" text-anchor="middle">people writing to you,</text>
+  <text class="ts" x="357" y="53" text-anchor="middle">read when you choose</text>
+
+  <!-- the information sources: everything that feeds RSSBox, and what waits for the sweep -->
+  <rect class="src" x="6" y="112" width="424" height="206" rx="8"/>
+  <text class="th" x="16" y="308">INFORMATION SOURCES</text>
+
+  <rect class="n" x="14" y="168" width="88" height="44" rx="6"/>
+  <text class="tb" x="58" y="188" text-anchor="middle">mail</text>
+  <text class="ts" x="58" y="204" text-anchor="middle">every message</text>
+  <line class="flow" x1="102" y1="190" x2="114" y2="190" marker-end="url(#p)"/>
+
+  <rect class="prim" x="116" y="168" width="88" height="44" rx="6"/>
+  <text class="tb" x="160" y="188" text-anchor="middle">Sieve</text>
+  <text class="ts" x="160" y="204" text-anchor="middle">your rules</text>
+
+  <!-- Sieve's four ways out, all right-angled -->
+  <path class="flow" d="M148 168 V62" marker-end="url(#p)"/>
+  <path class="flow" d="M172 168 V94 H357 V62" marker-end="url(#p)"/>
+  <path class="flow" d="M204 190 H216 V150 H228" marker-end="url(#p)"/>
+  <path class="flow" d="M204 190 H216 V206 H228" marker-end="url(#p)"/>
+
+  <rect class="n" x="230" y="124" width="190" height="52" rx="6"/>
+  <text class="t" x="325" y="141" text-anchor="middle">unrouted mail</text>
+  <text class="ts" x="325" y="156" text-anchor="middle">a folder per service, or one</text>
+  <text class="ts" x="325" y="169" text-anchor="middle">cleared by the weekly sweep</text>
+
+  <rect class="n" x="230" y="186" width="190" height="40" rx="6"/>
+  <text class="t" x="325" y="203" text-anchor="middle">*-rss folders</text>
+  <text class="ts" x="325" y="218" text-anchor="middle">mail you read as feeds</text>
+
+  <rect class="n" x="230" y="256" width="190" height="40" rx="6"/>
+  <text class="t" x="325" y="273" text-anchor="middle">websites, profiles, feeds</text>
+  <text class="ts" x="325" y="288" text-anchor="middle">RSS / Atom, RSS-Bridge, scrapers</text>
+
+  <!-- mail folders reach the hub as feeds, through mailfeed -->
+  <line class="flow" x1="420" y1="206" x2="446" y2="206" marker-end="url(#p)"/>
+  <rect class="prim" x="448" y="184" width="128" height="44" rx="6"/>
+  <text class="tb" x="512" y="204" text-anchor="middle">mailfeed</text>
+  <text class="ts" x="512" y="220" text-anchor="middle">mail folders as feeds</text>
+  <line class="flow" x1="512" y1="228" x2="512" y2="250" marker-end="url(#p)"/>
+
+  <line class="flow" x1="420" y1="276" x2="446" y2="276" marker-end="url(#p)"/>
+
+  <rect class="prim" x="448" y="252" width="128" height="48" rx="6"/>
+  <text class="tb" x="512" y="272" text-anchor="middle">RSSBox</text>
+  <text class="ts" x="512" y="288" text-anchor="middle">filter, summarize, group</text>
+  <line class="flow" x1="576" y1="276" x2="586" y2="276" marker-end="url(#p)"/>
+
+  <rect class="entry" x="588" y="254" width="86" height="44" rx="6"/>
+  <text class="tb" x="631" y="274" text-anchor="middle">Miniflux</text>
+  <text class="ts" x="631" y="290" text-anchor="middle">every device</text>
+
+  <rect class="entry" x="12" y="340" width="12" height="12" rx="2"/><text class="ts" x="30" y="350">where it reaches you</text>
+  <rect class="prim" x="172" y="340" width="12" height="12" rx="2"/><text class="ts" x="190" y="350">sorts, publishes, filters, summarizes</text>
+  <rect class="n" x="408" y="340" width="12" height="12" rx="2"/><text class="ts" x="426" y="350">folders and sources</text>
+</svg>

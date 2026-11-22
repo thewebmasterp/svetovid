@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# check — lane-deliveries' health for doctor: the shop lists in the deployed
+# script, the state, the bridge channels and the hub tag all agree.
+out="$(python3 -I "$(dirname "$(readlink -f "$0")")/deliv" check --remote 2>&1)"; rc=$?
+lines="$(grep -E "^\s+(FAIL|ok)" <<<"$out" | sed -E "s/^\s+FAIL/FAIL/; s/^\s+ok  /OK  /")"
+[[ -z "$lines" ]] || echo "$lines"
+# it stopped before it could report (the rules repo unreachable, a crash): say why
+if [[ $rc -ne 0 ]] && ! grep -q '^FAIL' <<<"$lines"; then
+    echo "FAIL the check stopped: $(tail -n 1 <<<"$out")"
+fi
+[[ $rc -eq 0 ]] || exit 1

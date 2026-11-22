@@ -1,0 +1,872 @@
+#!/usr/bin/env -S python3 -I
+"""ms -- the sweep skill's helper: the weekly sign-off of unread service mail.
+
+  ms sync                         sync the local copy (mail.quick_sync_command), server folders == local, opens this week's run
+  ms scan                         overview: category -> folder -> unread; uncategorized/gone folders
+  ms scan <category> [--snippets auto|all|none]
+                                  the batch: groups per folder with flags; writes the batch manifest
+  ms show <ref> [-n N] [--chars C]
+                                  bodies. ref = g12 (latest scanned batch), <category>:g12, or a message id
+  ms signoff <category> [--keep REF ...] [--include-live]
+                                  mark the batch read, push to the server, verify it there
+  ms cat list | set <folder> <category> | rm <folder> | order <cat> ...
+  ms know list [--open] | add ... | set <id> ...       the decisions log
+  ms handoff [--mark-handed]      material for the route / lane-urgent prompts
+  ms type-headers [add|rm NAME ...]
+                                  platform headers that name a mail's kind; batches group by them
+  ms trash [--empty]              list Trash on the server (remembers the listing);
+                                  --empty deletes exactly the listed mails, after the user said yes
+
+Read-only except: sync, signoff (\\Seen flags only), cat/know (state files),
+trash --empty (expunges the listed Trash mails, nothing else).
+Never moves mail; never deletes outside Trash.
+"""
+import argparse, collections, contextlib, datetime as dt, email.parser, email.policy, fcntl, fnmatch, html
+import importlib.machinery, json, os, re, subprocess, sys, time
+from email.utils import parseaddr, parsedate_to_datetime
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+_HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE.parents[2] / "lib"))
+import svetovid as sv  # noqa: E402
+
+MAILDIR = str(sv.path("mail.maildir"))
+# notmuch names folders relative to its database root: by default the
+# maildir's own name (database root = its parent).
+NOTMUCH_PREFIX = sv.get("mail.notmuch_prefix", os.path.basename(MAILDIR.rstrip("/")))
+STATE = os.environ.get("SVETOVID_SWEEP_STATE") or str(sv.skill_home("sweep"))
+CATS = os.path.join(STATE, "categories.json")
+KNOWN = os.path.join(STATE, "known.json")
+RUNLOG = os.path.join(STATE, "runs.md")
+CACHE = os.environ.get("SVETOVID_SWEEP_CACHE") or str(sv.cache() / "sweep")
+SIEVE_SIM = str(_HERE.parents[1] / "mail-rules" / "scripts" / "sieve-sim")
+
+PROBE = sv.get("rules.probe.tag", "sieveprobe")
+# Type headers: some platforms name the kind of each mail in a header of their
+# own; a batch is grouped by it when present. Which headers those are is
+# learned from the user's mail (`ms type-headers`), never assumed.
+TYPES = os.path.join(STATE, "type-headers.json")
+# folder = another named folder (e.g. a forwarded work account's folder; give it as --dest)
+DECISIONS = ("stays", "urgent", "inbox", "rss", "folder", "sender-off", "other")
+STATUSES = ("final", "approved", "handed", "built", "dropped")
+HDR = email.parser.BytesHeaderParser(policy=email.policy.default)
+FULL = email.parser.BytesParser(policy=email.policy.default)
+
+
+# ---------------------------------------------------------------- state
+
+def jload(path, default):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        return default
+
+
+@contextlib.contextmanager
+def state_lock():
+    """One writer at a time for the decisions log. Several route agents mark
+    their patterns built at the same moment; without this the later write
+    silently drops the earlier one."""
+    os.makedirs(STATE, exist_ok=True)
+    with open(os.path.join(STATE, ".lock"), "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        yield
+
+
+def check_regex(pattern, what):
+    try:
+        re.compile(pattern)
+    except re.error as e:
+        sys.exit(f"ms: {what} is not a regular expression ({e}): {pattern!r}")
+
+
+def jsave(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as fh:
+        json.dump(data, fh, indent=1, ensure_ascii=False)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+def cats():
+    return jload(CATS, {"order": [], "folders": {}})
+
+
+def known():
+    return jload(KNOWN, {"next": 1, "patterns": []})
+
+
+def run_dir():
+    y, w, _ = dt.date.today().isocalendar()
+    d = os.path.join(CACHE, f"{y}-W{w:02d}")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def slug(cat):
+    return re.sub(r"[^a-z0-9]+", "-", cat.lower()).strip("-")
+
+
+def find_cat(name, c):
+    for cat in c["order"]:
+        if slug(cat) == slug(name) or cat.lower() == name.lower():
+            return cat
+    sys.exit(f"ms: no category {name!r}; have: {', '.join(c['order'])}")
+
+
+def batch_path(cat):
+    return os.path.join(run_dir(), slug(cat) + ".json")
+
+
+# ---------------------------------------------------------------- mail access
+
+def service_folders():
+    out = []
+    for n in sorted(os.listdir(MAILDIR), key=str.lower):
+        if os.path.isdir(os.path.join(MAILDIR, n, "cur")) and sv.is_service_folder(n):
+            out.append(n)
+    return out
+
+
+def q_folder(f):
+    return f'folder:"{NOTMUCH_PREFIX}/{f}"'
+
+
+def count(query):
+    r = subprocess.run(["notmuch", "count", query], capture_output=True, text=True)
+    if r.returncode:        # a locked or broken database must not read as "0 unread"
+        sys.exit(f"ms: notmuch count failed: {r.stderr.strip()[-200:]}")
+    return int(r.stdout.strip() or 0)
+
+
+def unread_messages(folder):
+    """[(notmuch id, file in this folder)] for unread mail in folder."""
+    r = subprocess.run(["notmuch", "show", "--format=json", "--body=false", "--entire-thread=false",
+                        f"{q_folder(folder)} and tag:unread"], capture_output=True, text=True, check=True)
+    out = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            if node.get("match"):
+                files = node.get("filename") or []
+                mine = [p for p in files if f"/{NOTMUCH_PREFIX}/{folder}/" in p] or files
+                if mine:
+                    out.append((node["id"], mine[0]))
+        elif isinstance(node, list):
+            for x in node:
+                walk(x)
+    walk(json.loads(r.stdout or "[]"))
+    return out
+
+
+def files_for(mid):
+    r = subprocess.run(["notmuch", "search", "--output=files", f"id:{nm_quote(mid)}"],
+                       capture_output=True, text=True)
+    return [x for x in r.stdout.splitlines() if x]
+
+
+def nm_quote(mid):
+    return '"' + mid.replace('"', '""') + '"'
+
+
+def sender_of(m):
+    return parseaddr(sv.real_sender(m))[1].lower()
+
+
+def date_of(m):
+    try:
+        return parsedate_to_datetime(str(m["Date"])).date().isoformat()
+    except Exception:
+        return "?"
+
+
+def subject_of(m):
+    return " ".join(str(m.get("Subject", "") or "").split())
+
+
+def body_text(path, chars):
+    with open(path, "rb") as fh:
+        m = FULL.parse(fh)
+    try:
+        part = m.get_body(preferencelist=("plain", "html"))
+        text = part.get_content() if part else ""
+        if part is not None and part.get_content_subtype() == "html":
+            text = re.sub(r"<(style|script|head)[^>]*>.*?</\1>", " ", text, flags=re.S | re.I)
+            text = re.sub(r"<br\s*/?>|</(p|div|tr|li|h\d)>", "\n", text, flags=re.I)
+            text = html.unescape(re.sub(r"<[^>]+>", " ", text))
+    except Exception as e:
+        text = f"(body unreadable: {e})"
+    text = re.sub(r"https?://\S{60,}", "<long url>", text)
+    text = re.sub(r"[ \t ‌͏]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n", text).strip()
+    return text[:chars] + (" …" if len(text) > chars else "")
+
+
+def imap():
+    return sv.imap()
+
+
+def server_folders(m):
+    typ, data = m.list()
+    out = set()
+    for line in data:
+        s = line.decode() if isinstance(line, bytes) else str(line)
+        mm = re.match(r'\((.*?)\) (?:"[^"]*"|NIL) (.*)$', s)
+        if mm:
+            out.add(mm.group(2).strip().strip('"'))
+    return out
+
+
+def mbsync():
+    for _ in range(60):
+        if subprocess.run(["pgrep", "-x", "mbsync"], capture_output=True).returncode != 0:
+            break
+        time.sleep(2)
+    r = sv.run(sv.get("mail.quick_sync_command"), capture_output=True)
+    if r.returncode != 0:
+        print("ms: sync failed:\n" + (r.stderr or r.stdout)[-1500:], file=sys.stderr)
+    return r.returncode
+
+
+# ---------------------------------------------------------------- live rules
+
+_SIM = None
+
+
+def live_classifier():
+    """classify() of sieve-sim (mail-rules), run against the DEPLOYED script."""
+    global _SIM
+    if _SIM is None:
+        _SIM = importlib.machinery.SourceFileLoader("sieve_sim", SIEVE_SIM).load_module()
+        try:
+            path = _SIM.live_script()
+        except SystemExit as e:
+            print(f"ms: could not read the deployed script ({e}); using the checkout", file=sys.stderr)
+            path = _SIM.script_path()
+        _SIM._rules_cache = _SIM.Script(path)
+    return lambda msg: _SIM.classify(msg, _SIM._rules_cache)
+
+
+# ---------------------------------------------------------------- known patterns
+
+def matches(p, folder, sender, subj, msg):
+    if p.get("status") == "dropped":
+        return False
+    if p["svc"] not in ("*", folder):
+        return False
+    if p.get("from") and not fnmatch.fnmatch(sender, p["from"].lower()):
+        return False
+    if p.get("subject") and not re.search(p["subject"], subj, re.I):
+        return False
+    if p.get("header"):
+        name, _, glob = p["header"].partition("=")
+        if not fnmatch.fnmatch(str(msg.get(name.strip(), "") or ""), glob.strip()):
+            return False
+    return True
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_sync(a):
+    t0 = time.time()
+    rc = mbsync()
+    m = imap()
+    srv = server_folders(m) - {PROBE}
+    local = {n for n in os.listdir(MAILDIR) if os.path.isdir(os.path.join(MAILDIR, n, "cur"))}
+    bad = False
+    if srv - local:
+        print("ms: on the server but not local:", ", ".join(sorted(srv - local)))
+        bad = True
+    if local - srv:
+        print("ms: local but not on the server:", ", ".join(sorted(local - srv)))
+        bad = True
+    diff = []
+    total = 0
+    for f in service_folders():
+        typ, data = m.status(f'"{f}"', "(UNSEEN)")
+        su = int(re.search(rb"UNSEEN (\d+)", data[0]).group(1)) if typ == "OK" else -1
+        lu = count(f"{q_folder(f)} and tag:unread")
+        total += lu
+        if su != lu:
+            diff.append(f"{f} server {su} / local {lu}")
+    m.logout()
+    if diff:
+        print("ms: unread differs (run ms sync again; if it persists, investigate):\n  " + "\n  ".join(diff))
+        bad = True
+    print(f"ms sync: sync rc={rc}, {len(service_folders())} service folders, {total} unread, "
+          f"run {os.path.basename(run_dir())}, {time.time() - t0:.0f}s" + ("" if not bad else "  (MISMATCH above)"))
+    return 1 if (rc or bad) else 0
+
+
+def cmd_scan(a):
+    c = cats()
+    folders = service_folders()
+    if not a.category:
+        return overview(c, folders)
+    cat = find_cat(a.category, c)
+    type_headers = tuple(jload(TYPES, []))
+    mine = [f for f in folders if c["folders"].get(f) == cat]
+    pats = [p for p in known()["patterns"]]
+    classify = live_classifier()
+    batch = {"category": cat, "scanned": dt.datetime.now().isoformat(timespec="seconds"),
+             "folders": {}, "groups": {}, "live": {}, "known": {}, "signed": None}
+    gn = 0
+    total = 0
+    print(f"# {cat}: scan {batch['scanned']}")
+    for f in mine:
+        msgs = unread_messages(f)
+        if not msgs:
+            continue
+        total += len(msgs)
+        batch["folders"][f] = [mid for mid, _ in msgs]
+        groups = collections.OrderedDict()
+        for mid, path in msgs:
+            with open(path, "rb") as fh:
+                m = HDR.parse(fh)
+            s, subj, d = sender_of(m), subject_of(m), date_of(m)
+            typ = next((f"{h}={m[h]}" for h in type_headers if m.get(h)), "")
+            key = (s, typ or re.sub(r"\d+", "#", subj)[:80])
+            g = groups.setdefault(key, {"folder": f, "sender": s, "type": typ, "ids": [], "dates": [],
+                                        "subjects": collections.Counter(), "lu": 0, "known": set(),
+                                        "live": collections.Counter(), "newest": ("", "")})
+            g["ids"].append(mid)
+            g["dates"].append(d)
+            g["subjects"][subj[:100]] += 1
+            g["lu"] += bool(m.get("List-Unsubscribe"))
+            if d >= g["newest"][0]:
+                g["newest"] = (d, path)
+            for p in pats:
+                if matches(p, f, s, subj, m):
+                    g["known"].add(p["id"])
+                    batch["known"][mid] = p["id"]
+                    break
+            try:
+                dest = classify(m)[0]
+            except Exception as e:
+                dest = f"?{type(e).__name__}"
+            if dest != f:
+                g["live"][dest] += 1
+                batch["live"][mid] = dest
+        print(f"\n== {f}  ({len(msgs)} unread)")
+        for g in sorted(groups.values(), key=lambda g: (-len(g["ids"]), g["sender"])):
+            gn += 1
+            gid = f"g{gn}"
+            ds = sorted(g["dates"])
+            span = ds[0] if ds[0] == ds[-1] else f"{ds[0]}..{ds[-1]}"
+            lu = "LU" if g["lu"] else "  "
+            flags = []
+            if g["known"]:
+                flags += [f"known {k} {next(p for p in pats if p['id'] == k)['decision']}" for k in sorted(g["known"])]
+            if g["live"]:
+                flags += [f"live rules -> {d}: {n}" for d, n in g["live"].items()]
+            print(f"  {gid:<5}{len(g['ids']):4}x {lu} {span}  {g['sender']}" + (f"  [{g['type']}]" if g["type"] else ""))
+            subs = [f"{s!r}" + (f" x{n}" if n > 1 else "") for s, n in g["subjects"].most_common(3)]
+            more = len(g["subjects"]) - 3
+            print("         " + " | ".join(subs) + (f" | +{more} more" if more > 0 else ""))
+            if flags:
+                print("         [" + "; ".join(flags) + "]")
+            want = a.snippets == "all" or (a.snippets == "auto" and not g["known"] and not g["lu"])
+            if want:
+                print("         > " + body_text(g["newest"][1], 220).replace("\n", " / "))
+            batch["groups"][gid] = {"folder": f, "sender": g["sender"], "type": g["type"], "ids": g["ids"],
+                                    "first": ds[0], "last": ds[-1], "lu": g["lu"],
+                                    "subjects": [s for s, _ in g["subjects"].most_common(5)],
+                                    "known": sorted(g["known"]), "live": dict(g["live"])}
+    jsave(batch_path(cat), batch)
+    print(f"\n{cat}: {total} unread in {len(batch['folders'])} folders, {gn} groups, "
+          f"{len(batch['known'])} match known patterns, {len(batch['live'])} the live rules would move")
+    return 0
+
+
+def overview(c, folders):
+    rd = run_dir()
+    unread = {f: count(f"{q_folder(f)} and tag:unread") for f in folders}
+    by = collections.defaultdict(list)
+    for f in folders:
+        by[c["folders"].get(f)].append(f)
+    print(f"run {os.path.basename(rd)}  ({sum(unread.values())} unread in service folders)\n")
+    for cat in c["order"]:
+        fs = by.get(cat, [])
+        n = sum(unread[f] for f in fs)
+        b = jload(batch_path(cat), None)
+        state = "signed " + b["signed"]["at"][:16] if b and b.get("signed") else ("scanned" if b else "")
+        busy = ", ".join(f"{f} {unread[f]}" for f in sorted(fs, key=lambda f: -unread[f]) if unread[f])
+        print(f"  {cat:<20} {n:5}  {state:<24} {busy}")
+    if by.get(None):
+        print("\nUNCATEGORIZED (assign with: ms cat set <folder> <category>):")
+        for f in by[None]:
+            print(f"  {f:<24} {unread[f]} unread")
+    gone = sorted(set(c["folders"]) - set(folders))
+    if gone:
+        print("\nGONE from the server (ms cat rm <folder>):", ", ".join(gone))
+    k = known()["patterns"]
+    op = [p for p in k if p["status"] in ("approved", "handed")]
+    print(f"\ndecisions log: {len(k)} patterns, {len(op)} routes approved but not built "
+          f"({sum(p['status'] == 'handed' for p in op)} handed off)")
+    return 0
+
+
+def resolve(ref, batch=None):
+    """-> list of (mid, path)."""
+    mm = re.fullmatch(r"(?:([\w&-]+):)?(g\d+)", ref)
+    if mm:
+        if batch is None:
+            if mm.group(1):
+                batch = jload(batch_path(find_cat(mm.group(1), cats())), None)
+            else:
+                # latest *scanned* batch: signoff rewrites its file, so mtime would lie
+                bs = week_batches()
+                batch = max(bs, key=lambda b: b["scanned"]) if bs else None
+        if not batch or mm.group(2) not in batch["groups"]:
+            sys.exit(f"ms: no group {ref} in the current batch")
+        g = batch["groups"][mm.group(2)]
+        out = []
+        for mid in g["ids"]:
+            fs = files_for(mid)
+            mine = [p for p in fs if f"/{g['folder']}/" in p] or fs
+            out.append((mid, mine[0] if mine else None))
+        return out
+    mid = ref.strip("<>").removeprefix("id:")
+    fs = files_for(mid)
+    return [(mid, fs[0] if fs else None)]
+
+
+def cmd_show(a):
+    for ref in a.ref:
+        items = resolve(ref)
+        dated = []
+        for mid, path in items:
+            if not path:
+                print(f"--- {mid}: no file (moved or deleted since the scan?)")
+                continue
+            with open(path, "rb") as fh:
+                m = HDR.parse(fh)
+            dated.append((date_of(m), mid, path, m))
+        dated.sort(reverse=True)
+        print(f"### {ref}: {len(items)} message(s), showing {min(a.n, len(dated))}")
+        for d, mid, path, m in dated[:a.n]:
+            print(f"--- {d}  {sender_of(m)}\n    Subject: {subject_of(m)}\n    id: {mid}")
+            print("    " + body_text(path, a.chars).replace("\n", "\n    "))
+    return 0
+
+
+def cmd_signoff(a):
+    c = cats()
+    cat = find_cat(a.category, c)
+    bp = batch_path(cat)
+    batch = jload(bp, None)
+    if not batch:
+        sys.exit(f"ms: no batch for {cat} this week; run ms scan {slug(cat)} first")
+    keep = set()
+    in_batch = {mid for ids in batch["folders"].values() for mid in ids}
+    for ref in a.keep:
+        mids = {mid for mid, _ in resolve(ref, batch if re.fullmatch(r"g\d+", ref) else None)}
+        if not mids & in_batch:
+            sys.exit(f"ms signoff: --keep {ref} names nothing in this week's {cat} batch (a typo, or a group of "
+                     "another category?). Nothing was marked read.")
+        keep |= mids
+    if not a.include_live:
+        keep |= set(batch["live"])
+    sign = {f: [mid for mid in ids if mid not in keep] for f, ids in batch["folders"].items()}
+    allids = [mid for ids in sign.values() for mid in ids]
+    if not allids:
+        print("ms signoff: nothing to mark")
+    else:
+        lines = "".join(f"-unread -- id:{nm_quote(mid)}\n" for mid in allids)
+        r = subprocess.run(["notmuch", "tag", "--batch"], input=lines, text=True, capture_output=True)
+        if r.returncode:
+            sys.exit("ms: notmuch tag failed: " + r.stderr)
+    rc = mbsync()
+    # verify on the server: none of the signed Message-IDs may still be UNSEEN
+    m = imap()
+    bad, rows = 0, []
+    for f, ids in sign.items():
+        want = {x.lower() for x in ids}
+        m.select(f'"{f}"', readonly=True)
+        typ, data = m.uid("SEARCH", None, "UNSEEN")
+        uids = data[0].split() if typ == "OK" and data and data[0] else []
+        still = 0
+        if uids:
+            for i in range(0, len(uids), 200):
+                typ, fd = m.uid("FETCH", b",".join(uids[i:i + 200]), "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
+                for part in fd:
+                    if isinstance(part, tuple):
+                        hv = HDR.parsebytes(part[1]).get("Message-ID", "")
+                        if str(hv).strip().strip("<>").lower() in want:
+                            still += 1
+        bad += still
+        rows.append(f"  {f:<22} signed {len(ids):4}  still unseen on server {still}  unread left {len(uids)}")
+    m.logout()
+    print("\n".join(rows))
+    kept_live = len(set(batch["live"]) - set(allids))
+    inbatch = {x for ids in batch["folders"].values() for x in ids}
+    print(f"ms signoff {cat}: {len(allids)} marked read, {len(keep & inbatch)} "
+          f"kept unread ({kept_live} the live rules would move), sync rc={rc}, "
+          + ("VERIFIED on server" if not bad and not rc else f"{bad} NOT seen on server"))
+    batch["signed"] = {"at": dt.datetime.now().isoformat(timespec="seconds"), "ids": allids,
+                       "kept": sorted(keep), "verified": not bad and not rc}
+    jsave(bp, batch)
+    os.makedirs(STATE, exist_ok=True)
+    with open(RUNLOG, "a") as fh:
+        fh.write(f"- {batch['signed']['at'][:16]} {os.path.basename(run_dir())} {cat}: {len(allids)} read, "
+                 f"{len(batch['signed']['kept'])} kept, "
+                 f"{'verified' if batch['signed']['verified'] else 'NOT VERIFIED'}\n")
+    return 1 if bad or rc else 0
+
+
+def cmd_cat(a):
+    c = cats()
+    if a.op == "list":
+        for cat in c["order"]:
+            fs = sorted(f for f, x in c["folders"].items() if x == cat)
+            print(f"{cat}: {', '.join(fs)}")
+        return 0
+    if a.op == "set":
+        folder, cat = a.args
+        cat = next((x for x in c["order"] if slug(x) == slug(cat)), cat)
+        if cat not in c["order"]:
+            c["order"].append(cat)
+            print(f"ms: new category {cat!r} (appended to the order)")
+        c["folders"][folder] = cat
+    elif a.op == "rm":
+        for folder in a.args:
+            c["folders"].pop(folder, None)
+    elif a.op == "order":
+        new = [find_cat(x, c) for x in a.args]
+        c["order"] = new + [x for x in c["order"] if x not in new]
+    used = set(c["folders"].values())
+    c["order"] = [x for x in c["order"] if x in used]
+    jsave(CATS, c)
+    return 0
+
+
+def show_pattern(p):
+    match = ", ".join(f"{k}={p[k]!r}" for k in ("from", "subject", "header") if p.get(k)) or "whole folder"
+    s = (f"{p['id']:<4} {p['status']:<8} {p['decision']:<10} {p['svc']:<16} {p['kind']}\n"
+         f"     match: {match}" + (f"   dest: {p['dest']}" if p.get("dest") else "")
+         + f"   decided {p['decided']}" + (f", handed {p['handed']}" if p.get("handed") else ""))
+    if p.get("words"):
+        s += f"\n     user: \"{p['words']}\""
+    if p.get("samples"):
+        s += f"\n     seen: {p['samples']}"
+    if p.get("note"):
+        s += f"\n     note: {p['note']}"
+    return s
+
+
+def week_batches():
+    rd = run_dir()
+    bs = [jload(os.path.join(rd, x), None) for x in sorted(os.listdir(rd)) if x.endswith(".json")]
+    return [b for b in bs if b and "groups" in b]
+
+
+def find_group(ref, svc):
+    """Group for `know add/set --group`: [<category>:]gN. Group ids restart in every
+    category scan, so a bare gN is looked up in the batch whose gN belongs to folder
+    `svc` (the latest such scan); with svc '*' it means the latest scanned batch."""
+    mm = re.fullmatch(r"(?:([\w&-]+):)?(g\d+)", ref)
+    if not mm:
+        sys.exit(f"ms: --group wants gN or <category>:gN, not {ref!r}")
+    cat, gid = mm.groups()
+    cands = [b for b in week_batches() if gid in b["groups"]]
+    if cat:
+        cands = [b for b in cands if slug(b["category"]) == slug(cat)]
+    if svc and svc != "*":
+        cands = [b for b in cands if b["groups"][gid]["folder"] == svc]
+    elif not cat:
+        cands = sorted(cands, key=lambda b: b["scanned"])[-1:]
+    if not cands:
+        where = f"folder {svc}" if svc and svc != "*" else "this week's batches"
+        sys.exit(f"ms: no group {ref} in {where}; rescan the category or pass <category>:gN")
+    return max(cands, key=lambda b: b["scanned"])["groups"][gid]
+
+
+def attach_samples(p, g):
+    p["samples"] = f"{len(g['ids'])}x {g['first']}..{g['last']} {g['sender']}: " + " | ".join(g["subjects"][:3])
+    p["example_ids"] = g["ids"][:5]
+
+
+def cmd_know(a):
+    if a.op == "list":
+        return _know(a)
+    with state_lock():
+        return _know(a)
+
+
+def _know(a):
+    k = known()
+    if a.op == "list":
+        for p in k["patterns"]:
+            if a.open and p["status"] not in ("approved", "handed"):
+                continue
+            if a.svc and p["svc"] not in (a.svc, "*"):
+                continue
+            print(show_pattern(p))
+        return 0
+    if a.op == "add":
+        if not a.svc or not a.kind or not a.decision:
+            sys.exit("ms know add needs --svc, --kind and --decision")
+        if a.subject:
+            check_regex(a.subject, "--subject")
+        p = {"id": f"K{k['next']}", "svc": a.svc, "kind": a.kind, "decision": a.decision,
+             "status": "final" if a.decision == "stays" else "approved",
+             "decided": dt.date.today().isoformat()}
+        for f in ("from_", "subject", "header", "dest", "words", "note"):
+            v = getattr(a, f)
+            if v:
+                p[f.rstrip("_")] = v
+        if a.group:
+            attach_samples(p, find_group(a.group, a.svc))
+        k["next"] += 1
+        k["patterns"].append(p)
+        jsave(KNOWN, k)
+        print(show_pattern(p))
+        return 0
+    if a.op == "set":
+        ids = a.ids
+        unknown = [i for i in ids if i not in {p["id"] for p in k["patterns"]}]
+        if unknown or not ids:
+            sys.exit("ms know set: no such pattern: " + (", ".join(unknown) or "give an id (ms know list)"))
+        if a.subject:       # a broken matcher would stop every later scan
+            check_regex(a.subject, "--subject")
+        for p in k["patterns"]:
+            if p["id"] in ids:
+                for f in ("from_", "subject", "header", "dest", "words", "note", "kind", "decision", "status", "svc"):
+                    v = getattr(a, f)
+                    if v is not None:
+                        p[f.rstrip("_")] = v
+                if a.group:
+                    attach_samples(p, find_group(a.group, p["svc"]))
+                if a.status == "handed":
+                    p["handed"] = dt.date.today().isoformat()
+                print(show_pattern(p))
+        jsave(KNOWN, k)
+        return 0
+
+
+def cmd_handoff(a):
+    if not a.mark_handed:
+        return _handoff(a)
+    with state_lock():
+        return _handoff(a)
+
+
+def _handoff(a):
+    k = known()
+    batches = week_batches()
+    seen = collections.Counter()
+    for b in batches:
+        for mid, pid in b["known"].items():
+            seen[pid] += 1
+    by = collections.defaultdict(list)
+    for p in k["patterns"]:
+        if p["status"] == "approved" or (p["status"] == "handed" and seen[p["id"]]):
+            by[p["svc"]].append(p)
+    leftovers = collections.defaultdict(collections.Counter)
+    for b in batches:
+        kept = set(b["signed"]["kept"]) if b.get("signed") else set(b["live"])
+        for f, ids in b["folders"].items():
+            for mid in ids:
+                if mid in b["live"] and mid in kept:
+                    leftovers[f][b["live"][mid]] += 1
+    if not by and not leftovers:
+        print("ms handoff: nothing to hand off")
+        return 0
+    for svc in sorted(set(by) | set(leftovers)):
+        print(f"## {svc}")
+        for p in by.get(svc, []):
+            print(show_pattern(p))
+            if p["status"] == "handed":
+                print(f"     STILL ARRIVING in {svc} after hand-off ({seen[p['id']]} this week): route missing or misses")
+        for dest, n in leftovers.get(svc, {}).items():
+            print(f"     leftovers: {n} unread mail the LIVE rules would move to {dest} (arrived before the rule?) "
+                  f"-> rules-refile {svc} --to {dest}")
+        print()
+    if a.mark_handed:
+        today = dt.date.today().isoformat()
+        for ps in by.values():
+            for p in ps:
+                p["status"], p["handed"] = "handed", today
+        jsave(KNOWN, k)
+        print(f"ms handoff: marked {sum(map(len, by.values()))} pattern(s) handed {today}")
+    return 0
+
+
+TRASH = sv.get("mail.trash_folder", "")
+
+
+def cmd_type_headers(a):
+    """The learned list of platform type headers (see TYPES)."""
+    have = jload(TYPES, [])
+    if a.op in ("add", "rm"):
+        if not a.names:
+            sys.exit("ms type-headers add/rm needs a header name")
+        for name in a.names:
+            name = name.strip().rstrip(":")
+            if a.op == "add" and name and name.lower() not in [h.lower() for h in have]:
+                have.append(name)
+            elif a.op == "rm":
+                have = [h for h in have if h.lower() != name.lower()]
+        jsave(TYPES, have)
+    print("type headers: " + (", ".join(have) or "none learned yet (route's triage shows candidates)"))
+    return 0
+
+
+def cmd_trash(a):
+    """List Trash on the server and remember exactly what was shown; --empty deletes
+    only that shown set (mail trashed after the listing stays)."""
+    if not TRASH:
+        sys.exit("ms trash: mail.trash_folder is not set (doctor --folders shows the server's own trash folder)")
+    mf = os.path.join(run_dir(), "trash.listing")     # not *.json: those are the batch manifests
+    m = imap()
+    typ, d = m.select(f'"{TRASH}"')
+    if typ != "OK":
+        sys.exit(f"ms trash: cannot open {TRASH}: {d}")
+    uidv = m.response("UIDVALIDITY")[1][0].decode()
+    if not a.empty:
+        typ, d = m.uid("SEARCH", None, "ALL")
+        uids = d[0].split()
+        rows, size = [], 0
+        if uids:
+            typ, d = m.uid("FETCH", b",".join(uids),
+                           "(UID RFC822.SIZE BODY.PEEK[HEADER.FIELDS (DATE FROM SUBJECT MESSAGE-ID)])")
+            for part in d:
+                if not isinstance(part, tuple):
+                    continue
+                meta = part[0].decode()
+                h = HDR.parsebytes(part[1])
+                uid = re.search(r"UID (\d+)", meta).group(1)
+                sz = int(re.search(r"RFC822\.SIZE (\d+)", meta).group(1))
+                size += sz
+                rows.append({"uid": uid, "date": date_of(h), "from": sender_of(h),
+                             "subject": subject_of(h)[:90], "mid": str(h.get("Message-ID", "")).strip("<> ")})
+        rows.sort(key=lambda r: r["date"], reverse=True)
+        jsave(mf, {"listed": dt.datetime.now().isoformat(timespec="seconds"), "uidvalidity": uidv,
+                   "rows": rows, "size": size})
+        m.logout()
+        print(f"# {TRASH} on the server: {len(rows)} mails, {size / 1024:.0f} KB")
+        for r in rows:
+            print(f"  {r['date']}  {r['from'][:40]:<40}  {r['subject']}")
+        if rows:
+            print(f"\nms trash --empty deletes exactly these {len(rows)} (permanently).")
+        return 0
+    lst = jload(mf, None)
+    if not lst or not lst["rows"]:
+        sys.exit("ms trash --empty: nothing listed this week; run ms trash first and show it to the user")
+    if lst["uidvalidity"] != uidv:
+        sys.exit("ms trash --empty: Trash UIDVALIDITY changed since the listing; run ms trash again")
+    uids = [r["uid"] for r in lst["rows"]]
+    typ, d = m.uid("SEARCH", None, "UID " + ",".join(uids))
+    present = d[0].split() if d and d[0] else []
+    if present:
+        m.uid("STORE", b",".join(present), "+FLAGS.SILENT", r"(\Deleted)")
+        if "UIDPLUS" in m.capabilities:
+            m.uid("EXPUNGE", b",".join(present))
+        else:
+            m.expunge()
+    typ, d = m.uid("SEARCH", None, "UID " + ",".join(uids))
+    left = d[0].split() if d and d[0] else []
+    typ, d = m.status(f'"{TRASH}"', "(MESSAGES)")
+    remain = re.search(rb"MESSAGES (\d+)", d[0]).group(1).decode()
+    m.logout()
+    rc = mbsync()
+    lst["emptied"] = {"at": dt.datetime.now().isoformat(timespec="seconds"), "deleted": len(present) - len(left),
+                      "still_there": len(left)}
+    jsave(mf, lst)
+    with open(RUNLOG, "a") as fh:
+        fh.write(f"* {lst['emptied']['at'][:16]} {os.path.basename(run_dir())} Trash: "
+                 f"{len(present) - len(left)} deleted{', NOT ALL' if left else ''}\n")
+    print(f"ms trash --empty: {len(present) - len(left)} deleted on the server "
+          f"({len(uids) - len(present)} already gone), {len(left)} still there, "
+          f"{remain} left in {TRASH} (arrived after the listing), sync rc={rc}"
+          + ("" if not left else "  -- NOT ALL DELETED"))
+    return 1 if left else 0
+
+
+def cmd_need(a):
+    """For doctor: is there unread service mail worth a sweep? Local and cheap:
+    counts and dates from notmuch, never mail content."""
+    folders = service_folders()
+    work, unread, oldest = [], 0, None
+    if folders:
+        q = "(" + " or ".join(q_folder(f) for f in folders) + ") and tag:unread"
+        unread = count(q)
+        r = subprocess.run(["notmuch", "search", "--format=json", "--sort=oldest-first", "--limit=1", q],
+                           capture_output=True, text=True)
+        try:
+            hit = json.loads(r.stdout or "[]")
+            oldest = dt.date.fromtimestamp(hit[0]["timestamp"]) if hit else None
+        except Exception:
+            oldest = None
+    age = (dt.date.today() - oldest).days if oldest else 0
+    min_unread = int(sv.get("sweep.need_unread", 30))
+    min_age = int(sv.get("sweep.need_age_days", 7))
+    if unread and (unread >= min_unread or age >= min_age):
+        work.append(f"{unread} unread service mails, the oldest from {age} days ago")
+    open_pats = [p for p in known()["patterns"] if p.get("status") == "approved"]
+    notes = [f"{len(open_pats)} approved pattern(s) not yet handed to route"] if open_pats else []
+    uncat = [f for f in folders if f not in cats()["folders"]]
+    if uncat:
+        notes.append(f"{len(uncat)} new folder(s) to categorise: {', '.join(uncat[:5])}")
+    sv.need_report("sweep", work, int(sv.get("sweep.routine_days", 14)), notes)
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="ms", description=__doc__.split("\n")[0])
+    sp = ap.add_subparsers(dest="cmd", required=True)
+    sp.add_parser("sync").set_defaults(fn=cmd_sync)
+    sp.add_parser("need").set_defaults(fn=cmd_need)
+    s = sp.add_parser("scan")
+    s.add_argument("category", nargs="?")
+    s.add_argument("--snippets", choices=("auto", "all", "none"), default="auto")
+    s.set_defaults(fn=cmd_scan)
+    s = sp.add_parser("show")
+    s.add_argument("ref", nargs="+")
+    s.add_argument("-n", type=int, default=2)
+    s.add_argument("--chars", type=int, default=1200)
+    s.set_defaults(fn=cmd_show)
+    s = sp.add_parser("signoff")
+    s.add_argument("category")
+    s.add_argument("--keep", action="append", default=[])
+    s.add_argument("--include-live", action="store_true")
+    s.set_defaults(fn=cmd_signoff)
+    s = sp.add_parser("cat")
+    s.add_argument("op", choices=("list", "set", "rm", "order"))
+    s.add_argument("args", nargs="*")
+    s.set_defaults(fn=cmd_cat)
+    s = sp.add_parser("know")
+    s.add_argument("op", choices=("list", "add", "set"))
+    s.add_argument("ids", nargs="*")
+    s.add_argument("--open", action="store_true")
+    s.add_argument("--svc")
+    s.add_argument("--kind")
+    s.add_argument("--decision", choices=DECISIONS)
+    s.add_argument("--status", choices=STATUSES)
+    s.add_argument("--from", dest="from_")
+    s.add_argument("--subject")
+    s.add_argument("--header")
+    s.add_argument("--dest")
+    s.add_argument("--words")
+    s.add_argument("--note")
+    s.add_argument("--group")
+    s.set_defaults(fn=cmd_know)
+    s = sp.add_parser("handoff")
+    s.add_argument("--mark-handed", action="store_true")
+    s.set_defaults(fn=cmd_handoff)
+    s = sp.add_parser("trash")
+    s.add_argument("--empty", action="store_true")
+    s.set_defaults(fn=cmd_trash)
+    s = sp.add_parser("type-headers")
+    s.add_argument("op", nargs="?", choices=("list", "add", "rm"), default="list")
+    s.add_argument("names", nargs="*")
+    s.set_defaults(fn=cmd_type_headers)
+    a = ap.parse_args()
+    return a.fn(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

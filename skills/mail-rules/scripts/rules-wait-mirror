@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# rules-wait-mirror <folder> [min] — wait (max 10 min) until the feed bridge's copy
+# of your mail holds at least <min> (default 1) messages in <folder>.
+# Uses feeds.mirror_count_command, a shell command with {folder} that prints a
+# number. Without it there is no separate copy to wait for: exits 0. Read-only.
+set -euo pipefail
+f="${1:?usage: rules-wait-mirror <folder> [min]}"; min="${2:-1}"
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")/../../.." && pwd)"; SV=(python3 -I "$ROOT/lib/svetovid.py")
+tpl="$("${SV[@]}" get feeds.mirror_count_command "")"
+[[ -n "$tpl" ]] || { echo "rules-wait-mirror: no feeds.mirror_count_command; nothing to wait for"; exit 0; }
+cmd="${tpl//\{folder\}/$f}"
+n=0
+for _ in $(seq 1 60); do
+    # a failing count (the host unreachable for a moment) is "0 so far", not the end of the wait
+    n="$(bash -c "$cmd" 2>/dev/null | tr -dc 0-9 || true)"; n="${n:-0}"
+    [[ "$n" -ge "$min" ]] && { echo "mirror $f: $n"; exit 0; }
+    sleep 10
+done
+echo "mirror $f: still $n after 10 min" >&2; exit 1

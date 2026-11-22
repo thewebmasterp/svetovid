@@ -1,0 +1,145 @@
+# svetovid config: the filled-in card (STACK.md).
+# Copy to $SVETOVID_HOME/config.toml (default ~/.config/svetovid/config.toml).
+# Never put a secret here: give a command that prints it (a keyring lookup).
+
+[mail]
+address = "me@example.org"                       # the mailbox (IMAP and ManageSieve login)
+imap_host = "imap.example.org"
+# imap_port = 993
+smtp_host = "smtp.example.org"                   # sieve-probe --via submit only
+smtp_port = 465
+password_command = "secret-tool lookup application mail"
+maildir = "~/Mail/me@example.org"                # the local copy (Maildir with cur/new folders)
+# notmuch names folders relative to its database root; default: the maildir's own name
+# notmuch_prefix = "me@example.org"
+sync_command = "mbsync -a && notmuch new"        # full sync
+quick_sync_command = "mbsync me@example.org >/dev/null; notmuch new --quiet >/dev/null 2>&1"
+# The alias service your forwards come through, if you use one. Each service
+# is one module in lib/aliases/ (addy_io.py is the one that exists; another
+# service needs its own, and doctor asks you to contribute it).
+# alias_service = "addy.io"
+# The server's own names for these three (`doctor --folders` prints them):
+trash_folder = "Trash"
+archive_folder = "Archive"
+junk_folder = "Junk"
+
+[rules]
+repo = "~/sieve"                                 # a git repo holding the script, with a remote named
+                                                 # "origin": that remote's branch is what is live
+script = "main.sieve"
+branch = "main"
+script_name = "main"                             # the script's name on the server
+# How a landed change reaches the server:
+#   managesieve  svetovid uploads and activates it (sieve-server)
+#   git-push     your repo's own hook uploads on push to the branch
+#   browser      you paste it into the provider's editor when asked
+upload = "managesieve"
+# verify = "none"                                # if your provider has no ManageSieve
+# managesieve_host = "imap.example.org"          # default: mail.imap_host
+# managesieve_port = 4190
+check_command = ""                               # optional offline validator, e.g. "check-sieve"
+urgent_folder = "Urgent"
+class_var = "why"
+service_var = "svc"
+not_routed = ["Sent", "Drafts"]                  # the server's sent and drafts folders (`doctor --folders`)
+# extra_not_service = ["SomeFolder"]             # more folders that never hold service mail
+
+# Pins for old mail no rule describes any more: the replay and re-files leave
+# it in `folder` (first match wins). The server never sees them.
+# [[rules.pin]]
+# header = "List-ID"
+# contains = "some-list"
+# folder = "Work"
+
+# Real test mail, sent after every landing. With no [[rules.probe.case]] the
+# step is skipped and doctor warns.
+[rules.probe]
+via = "mx"                                       # mx: like outside mail | submit: authenticated
+mx_host = "mx1.example.org"
+mx_helo = "probe.example.org"                    # must be a fully qualified name
+mx_from = "probe@example.org"
+tag = "sieveprobe"                               # subject tag, and the folder the probes create
+timeout = 150
+
+[[rules.probe.case]]
+to = "sieveprobe@me.example.org"
+expect = ["sieveprobe"]
+name = "service folder"
+hint = "Identity mail not in its folder: the deployed script is not yours, or the provider files it before your script runs."
+
+[[rules.probe.case]]
+to = "sieveprobe@me.example.org"
+subject = "verification code"
+expect = ["Urgent"]
+name = "Urgent key"
+hint = "The Urgent rules are not live."
+
+[[rules.probe.case]]
+to = "me@example.org"
+subject = "verification code"
+expect = ["INBOX"]
+name = "personal mail never reaches Urgent"
+
+[notifier]                                       # your own notifier's commands; all optional
+health_command = "systemctl --user is-active urgent-notifier"
+# For re-files into Urgent: pause, mark what is there as seen, resume.
+pause_command = "systemctl --user stop urgent-notifier"
+skip_command = "urgent-notifier --mark-seen Urgent"
+resume_command = "systemctl --user start urgent-notifier"
+
+[folders]
+scheme = "per-service"                           # or "by-kind": read by the skills' instructions;
+                                                 # the scripts go by the templates below
+service = "{svc}"
+feed = "{svc}-rss"
+deliveries = "{svc}-deliveries-rss"              # by kind: "deliveries-rss"
+
+# Accounts you can't move: forwarded to an alias, one watched folder each.
+# [[forwarded]]
+# folder = "Work"
+# address = "work@example.org"                   # a note for you; the scripts read only `folder`
+# notify = "Mon-Fri 09:00-17:00"                 # a note for your notifier; svetovid does not read it
+
+# Leave this whole table out for a mail-only setup (no bridge, hub or reader).
+[feeds]
+host_command = "ssh -o BatchMode=yes myserver"   # where the bridge and hub run; "" = this machine
+bridge = "mailfeed"                              # set = mail folders are published as feeds
+bridge_dir = "/srv/mailfeed/app"                 # holds feeds.toml
+bridge_container = "mailfeed"
+# bridge_lock = "/srv/mailfeed/.feeds.lock"      # default: beside bridge_dir
+bridge_url = "http://mailfeed.internal:8080"     # as the hub sees it (and the reader: --direct, hub = "none")
+mirror = "/srv/mailsync/mail/me@example.org"     # the bridge's read-only copy of the mail
+# a command printing how many mails the bridge's copy holds in {folder} (rules-wait-mirror)
+mirror_count_command = "ssh -o BatchMode=yes myserver 'ls /srv/mailsync/mail/me@example.org/{folder}/cur | wc -l'"
+hub = "rssbox"                                   # or "none": reader categories instead of tags
+hub_container = "rssbox"
+hub_tag_url = "http://rssbox:8000/rss/tag"       # as the reader sees it
+reader = "miniflux"                              # the one reader API the scripts speak
+reader_url = "https://reader.example.org/v1"
+reader_token_command = "secret-tool lookup application miniflux"
+source_prefix = "[MAIL] "
+
+[sweep]
+# need_unread = 30                               # prescribe a sweep at this many unread service mails
+# need_age_days = 7                              # ... or when the oldest is this old
+# routine_days = 14
+# Platform headers that name a mail's kind are learned, not set here (ms type-headers).
+
+[lanes.deliveries]
+tag = "deliveries"
+# routine_days = 30
+# Which words, senders and couriers mean "delivery mail" is not set here: the
+# lane learns them from your mail and keeps them in its own state.
+
+[lanes.urgent]
+# routine_days = 28
+
+[web_feed]
+# busy_gap_h = 48                                # sources that usually post within this many hours ...
+# silence_factor = 5                             # ... are flagged when silent this many times longer
+# ignore = ["[YT] Some Channel"]                 # sources whose silence is fine
+
+[doctor]
+# sync_max_age_h = 24
+command_prefix = "/svetovid:"                    # as installed from the plugin; "/" when the skills
+                                                 # are linked into a skills folder

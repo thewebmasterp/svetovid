@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 330" role="img" aria-label="svetovid's skills in three tiers: doctor on top checks every skill and prescribes; workflow skills (sweep, route, lane-urgent, lane-deliveries, for example a lane-promotions, web-feed) in the middle; two shared skills (mail-rules, feed-wiring) underneath, called by the workflows">
+  <style>
+    .bg { fill: #ffffff; }
+    .n { fill: #ffffff; stroke: #c9ced8; stroke-width: 1.5; }
+    .entry { fill: #e2f0f1; stroke: #1d6b73; stroke-width: 1.5; }
+    .prim { fill: #f6ecd9; stroke: #9a6614; stroke-width: 1.5; }
+    .fam { fill: none; stroke: #c9ced8; stroke-width: 1.5; stroke-dasharray: 5 4; }
+    .ghost { fill: none; stroke: #5a6376; stroke-width: 1.3; stroke-dasharray: 4 4; }
+    .t { fill: #1a2030; font: 11px ui-monospace, "SFMono-Regular", Menlo, monospace; }
+    .tg { fill: #5a6376; font: 11px ui-monospace, "SFMono-Regular", Menlo, monospace; }
+    .tb { fill: #1a2030; font: 600 13px ui-monospace, "SFMono-Regular", Menlo, monospace; }
+    .ts { fill: #5a6376; font: 11px system-ui, -apple-system, "Segoe UI", sans-serif; }
+    .th { fill: #5a6376; font: 10.5px ui-monospace, Menlo, monospace; letter-spacing: 0.08em; }
+    .bus { stroke: #5a6376; stroke-width: 1.2; fill: none; stroke-dasharray: 4 4; }
+    .call { stroke: #9a6614; stroke-width: 1.3; fill: none; }
+    .callg { stroke: #9a6614; stroke-width: 1.2; fill: none; stroke-dasharray: 4 4; }
+    .ah { fill: #9a6614; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #10141b; }
+      .n { fill: #181e28; stroke: #2c3442; }
+      .entry { fill: #17323a; stroke: #5ab8c1; }
+      .prim { fill: #352a17; stroke: #dcab55; }
+      .fam { stroke: #2c3442; }
+      .ghost { stroke: #9aa3b3; }
+      .t, .tb { fill: #e4e7ed; }
+      .ts, .th, .tg { fill: #9aa3b3; }
+      .bus { stroke: #9aa3b3; }
+      .call, .callg { stroke: #dcab55; }
+      .ah { fill: #dcab55; }
+    }
+  </style>
+  <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="ah" d="M0 0L10 5L0 10z"/></marker></defs>
+  <rect class="bg" x="0" y="0" width="680" height="330" rx="8"/>
+  <rect class="entry" x="270" y="22" width="140" height="40" rx="6"/>
+  <text class="tb" x="340" y="47" text-anchor="middle">doctor</text>
+  <text class="ts" x="262" y="46" text-anchor="end">you start it</text>
+  <text class="ts" x="420" y="40">checks every skill, prescribes,</text>
+  <text class="ts" x="420" y="54">never runs one</text>
+  <path class="bus" d="M340 62 V84 M60 84 H620 M60 84 V120 M172 84 V120 M284 84 V120 M396 84 V120 M620 84 V120"/>
+  <rect class="fam" x="226" y="98" width="340" height="76" rx="8"/>
+  <text class="th" x="300" y="112">LANE FAMILY</text>
+  <rect class="n" x="8" y="120" width="104" height="40" rx="6"/><text class="t" x="60" y="144" text-anchor="middle">sweep</text>
+  <rect class="n" x="120" y="120" width="104" height="40" rx="6"/><text class="t" x="172" y="144" text-anchor="middle">route</text>
+  <rect class="n" x="232" y="120" width="104" height="40" rx="6"/><text class="t" x="284" y="144" text-anchor="middle">lane-urgent</text>
+  <rect class="n" x="344" y="120" width="104" height="40" rx="6"/><text class="t" x="396" y="144" text-anchor="middle">lane-deliveries</text>
+  <rect class="ghost" x="456" y="120" width="104" height="40" rx="6"/><text class="tg" x="508" y="137" text-anchor="middle">lane-promotions</text><text class="ts" x="508" y="152" text-anchor="middle">for example</text>
+  <rect class="n" x="568" y="120" width="104" height="40" rx="6"/><text class="t" x="620" y="144" text-anchor="middle">web-feed</text>
+  <text class="ts" x="60" y="180" text-anchor="middle">writes route requests</text>
+  <line class="call" x1="172" y1="160" x2="222" y2="244" marker-end="url(#a)"/>
+  <line class="call" x1="172" y1="160" x2="420" y2="244" marker-end="url(#a)"/>
+  <line class="call" x1="284" y1="160" x2="236" y2="244" marker-end="url(#a)"/>
+  <line class="call" x1="396" y1="160" x2="250" y2="244" marker-end="url(#a)"/>
+  <line class="call" x1="396" y1="160" x2="434" y2="244" marker-end="url(#a)"/>
+  <line class="callg" x1="508" y1="160" x2="264" y2="244"/>
+  <line class="callg" x1="508" y1="160" x2="448" y2="244"/>
+  <line class="call" x1="620" y1="160" x2="462" y2="244" marker-end="url(#a)"/>
+  <rect class="prim" x="150" y="246" width="180" height="44" rx="6"/>
+  <text class="tb" x="240" y="266" text-anchor="middle">mail-rules</text>
+  <text class="ts" x="240" y="282" text-anchor="middle">edit, replay, upload, probe, re-file</text>
+  <rect class="prim" x="350" y="246" width="180" height="44" rx="6"/>
+  <text class="tb" x="440" y="266" text-anchor="middle">feed-wiring</text>
+  <text class="ts" x="440" y="282" text-anchor="middle">bridge channel, tag, reader</text>
+  <rect class="entry" x="12" y="308" width="12" height="12" rx="2"/><text class="ts" x="30" y="318">you start it</text>
+  <rect class="n" x="112" y="308" width="12" height="12" rx="2"/><text class="ts" x="130" y="318">you, or Claude after asking</text>
+  <rect class="prim" x="292" y="308" width="12" height="12" rx="2"/><text class="ts" x="310" y="318">used by other skills</text>
+  <path class="bus" d="M440 314 H464"/><text class="ts" x="470" y="318">doctor checks</text>
+  <line class="call" x1="560" y1="314" x2="584" y2="314"/><text class="ts" x="590" y="318">calls</text>
+</svg>

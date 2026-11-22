@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# check — feed-wiring's health for doctor: every mail channel is published,
+# in the hub with a working fetch, its tag followed by the reader, and no
+# reader feed is failing. One line per finding (OK/WARN/FAIL); exit 1 on FAIL.
+exec python3 -I "$(dirname "$(readlink -f "$0")")/feeds" check

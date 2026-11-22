@@ -1,0 +1,14 @@
+{
+  "name": "svetovid",
+  "owner": { "name": "thewebmasterp", "url": "https://github.com/thewebmasterp" },
+  "description": "svetovid: skills that help you build an RSS system on steroids, with your mail plugged in.",
+  "plugins": [
+    {
+      "name": "svetovid",
+      "source": "./",
+      "description": "Sieve rules proven on your whole archive, only urgent mail interrupts, mail and websites become feeds, and a doctor that says what needs doing.",
+      "category": "productivity",
+      "keywords": ["mail", "sieve", "rss", "feeds"]
+    }
+  ]
+}

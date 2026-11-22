@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# rules-start <name> — open a private workspace for one rules change.
+#
+# Creates <cache>/rules/<name>/sieve: a git worktree of rules.repo on branch
+# rules-<name>, based on origin/<branch>. Edit the script there, commit, then
+# rules-sim / rules-land. Nothing shared is touched, so several agents can work at
+# once (one per name). Refuses if the name is already taken.
+set -euo pipefail
+name="${1:?usage: rules-start <name>}"
+[[ "$name" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || { echo "rules-start: use lowercase letters, digits, . _ -" >&2; exit 1; }
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")/../../.." && pwd)"; SV=(python3 -I "$ROOT/lib/svetovid.py")
+REPO="$("${SV[@]}" path rules.repo)"; BRANCH="$("${SV[@]}" get rules.branch main)"
+SCRIPT="$("${SV[@]}" get rules.script)"
+WS="$("${SV[@]}" cache)/rules/$name"
+if [[ -e "$WS" ]]; then
+    echo "rules-start: $WS exists: another agent is working on '$name', or a run was not finished (rules-done $name)." >&2
+    exit 1
+fi
+mkdir -p "$(dirname "$WS")"
+git -C "$REPO" fetch -q origin
+git -C "$REPO" worktree add -q -b "rules-$name" "$WS/sieve" "origin/$BRANCH"
+cat <<MSG
+workspace: $WS
+  edit:    $WS/sieve/$SCRIPT (and the repo's docs); commit on branch rules-$name
+  replay:  rules-sim $name [sieve-sim args]          e.g. --diff, --show FOLDER, --explain FILE
+  dry run: rules-sim $name --refile <folder>        (server, read-only)
+  land:    rules-land $name    then: rules-refile <folder>, rules-done $name
+MSG

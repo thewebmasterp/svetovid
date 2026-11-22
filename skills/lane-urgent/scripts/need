@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""need — lane-urgent's need for doctor (one JSON line). Signals since the last
+audit (runs.md): generic Urgent keys the user approved in the sweep and nobody
+built, new services whose mail was never checked against the rules, service
+mail whose opening reads urgent but was not filed into Urgent, and the
+server's Urgent folder disagreeing with the replay. Mail bodies are read
+locally to count; only counts and service names are printed."""
+import datetime as dt
+import importlib.machinery
+import json
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parents[2] / "lib"))
+import svetovid as sv  # noqa: E402
+
+sim = importlib.machinery.SourceFileLoader("sieve_sim", str(HERE.parents[1] / "mail-rules" / "scripts" / "sieve-sim")).load_module()
+since = sv.last_run("lane-urgent") or (dt.date.today() - dt.timedelta(days=30)).isoformat()
+rows = sim.load(sim.Script(sim.live_script()))
+recent = [r for r in rows if r["date"] >= since and r["actual"] != sim.ARCHIVE]
+work = []
+
+# The sweep hands generic Urgent decisions (svc '*') to this lane, not to route.
+try:
+    pats = json.loads((sv.home() / "sweep" / "known.json").read_text(encoding="utf-8"))["patterns"]
+except (FileNotFoundError, ValueError, KeyError):
+    pats = []
+waiting = [p["id"] for p in pats if p.get("svc") == "*" and p.get("status") in ("approved", "handed")]
+if waiting:
+    work.append(f"{len(waiting)} generic Urgent pattern(s) approved in the sweep and not built: {', '.join(waiting)}")
+
+first = {}
+for r in rows:
+    if r["date"] and r["svc"] and (r["svc"] not in first or r["date"] < first[r["svc"]]):
+        first[r["svc"]] = r["date"]
+fresh = sorted(s for s, d in first.items() if d >= since)
+if fresh:
+    work.append(f"{len(fresh)} new service(s) since {since}: {', '.join(fresh[:8])}{' …' if len(fresh) > 8 else ''}")
+
+groups = defaultdict(list)
+for r in recent:
+    if r["svc"] and not r["urgent"]:
+        groups[(r["sender"], sim.norm(r["subject"])[:64])].append(r)
+notes = []
+if sim.body_phrases() is None:
+    notes.append("no body phrases learned yet: mail that reads urgent only in its body is not counted")
+smelly = sorted({k[0].rpartition("@")[2] for k, v in groups.items()
+                 if any(sim.body_smell(r["path"]) for r in v[:2])})
+if smelly:
+    work.append(f"{len(smelly)} sender domain(s) since {since} wrote mail that reads urgent but was not "
+                f"filed into Urgent: {', '.join(smelly[:6])}{' …' if len(smelly) > 6 else ''}")
+
+real = sim.urgent_folder_ids()
+predicted = {r["mid"] for r in recent if r["urgent"] and r["mid"]}
+extra = sum(1 for mid, v in real.items() if v[0] >= since and mid not in predicted)
+missing = sum(1 for mid in predicted if mid not in real)
+if extra or missing:
+    work.append(f"the server's Urgent disagrees with the replay since {since}: "
+                f"{extra} there but not predicted, {missing} predicted but not there")
+
+sv.need_report("lane-urgent", work, int(sv.get("lanes.urgent.routine_days", 28)), notes)

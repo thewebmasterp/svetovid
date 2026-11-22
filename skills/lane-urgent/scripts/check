@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# check — lane-urgent's health for doctor: the notifier that announces Urgent
+# runs (notifier.health_command). One line (OK/FAIL), exit 1 on FAIL.
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")/../../.." && pwd)"; SV=(python3 -I "$ROOT/lib/svetovid.py")
+cmd="$("${SV[@]}" get notifier.health_command "")"
+[[ -n "$cmd" ]] || { echo "WARN no notifier.health_command: nothing checks that Urgent mail notifies"; exit 0; }
+if out="$(bash -c "$cmd" 2>&1)"; then echo "OK   notifier: ${out:-running}"; else
+    echo "FAIL notifier is not running (${out:-no output}): Urgent mail does not notify (STACK.md, the parts table, Notifier for Urgent)"; exit 1; fi
